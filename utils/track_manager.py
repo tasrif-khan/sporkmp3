@@ -14,7 +14,7 @@ from mutagen.mp4 import MP4
 from datetime import timedelta
 
 class AudioTrack:
-    def __init__(self, url, filename, requester, file_size):
+    def __init__(self, url, filename, requester, file_size, is_permanent=False):
         self.url = url
         self.filename = filename
         self.requester = requester
@@ -29,6 +29,7 @@ class AudioTrack:
         self.playback_start_time = None  # Used to track playback position
         self.paused_position = 0  # Keeps track of position when paused
         self.is_paused = False  # Indicates if track is paused
+        self.is_permanent = is_permanent
     
     def get_audio_metadata(self, file_path):
         """Get audio metadata regardless of format"""
@@ -137,18 +138,22 @@ class AudioTrack:
 
     def cleanup(self):
         """Remove the downloaded file and reset track state"""
-        if self.downloaded_path and os.path.exists(self.downloaded_path):
+        # Only delete the file if it's not a permanent library file
+        if not self.is_permanent and self.downloaded_path and os.path.exists(self.downloaded_path):
             try:
                 os.remove(self.downloaded_path)
                 logging.info(f"Cleaned up file: {self.filename}")
             except Exception as e:
                 logging.error(f"Error removing file {self.downloaded_path}: {e}")
-            finally:
-                self.downloaded_path = None
-                self.position = 0  # Reset position on cleanup
-                self.playback_start_time = None
-                self.paused_position = 0
-                self.is_paused = False
+        elif self.is_permanent:
+            logging.debug(f"Skipping cleanup of permanent library file: {self.filename}")
+        
+        # Always reset the track state
+        self.downloaded_path = None
+        self.position = 0
+        self.playback_start_time = None
+        self.paused_position = 0
+        self.is_paused = False
 
     def to_dict(self):
         """Convert track information to dictionary for display"""

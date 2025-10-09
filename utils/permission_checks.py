@@ -18,7 +18,7 @@ def check_permissions():
         # Check if user is blacklisted
         if music_cog.db.is_user_blacklisted(interaction.guild_id, interaction.user.id):
             await interaction.response.send_message(
-                embed=music_cog.create_embed(
+                embed=music_cog.music_ui.create_embed(
                     f"{music_cog.emoji['error']} Access Denied",
                     "You are blacklisted from using this bot.",
                     discord.Color.red()
@@ -33,7 +33,7 @@ def check_permissions():
             user_roles = [role.id for role in interaction.user.roles]
             if not any(role_id in user_roles for role_id in whitelisted_roles):
                 await interaction.response.send_message(
-                    embed=music_cog.create_embed(
+                    embed=music_cog.music_ui.create_embed(
                         f"{music_cog.emoji['error']} Access Denied",
                         "You don't have the required role to use this bot.",
                         discord.Color.red()
@@ -52,7 +52,7 @@ def admin_only():
         if not interaction.user.guild_permissions.administrator:
             music_cog = interaction.client.get_cog('Music')
             await interaction.response.send_message(
-                embed=music_cog.create_embed(
+                embed=music_cog.music_ui.create_embed(
                     f"{music_cog.emoji['error']} Access Denied",
                     "This command requires administrator privileges.",
                     discord.Color.red()

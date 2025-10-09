@@ -14,7 +14,7 @@ class MusicPlayback:
         self.track_manager = track_manager
         self.music_state = music_state
         self.db = db
-        self.music_ui = music_ui  # Added music_ui for creating embeds
+        self.music_ui = music_ui
         self.ffmpeg_path = ffmpeg_path
     
     def get_pcm_audio(self, track, start_time=0, speed=None):
@@ -35,17 +35,14 @@ class MusicPlayback:
         
         # Format timestamp properly for FFmpeg
         timestamp = str(timedelta(seconds=int(start_time)))
-        options = f'-ss {timestamp}'
+        before_options = f'-ss {timestamp}'
         
-        # Determine appropriate bitrate based on file type
-        # Default to 192k but use higher for high-quality sources
+        # Determine appropriate bitrate based on file type (keep variable bitrate)
         if hasattr(track, 'bitrate') and track.bitrate:
-            original_bitrate = track.bitrate
-            track.bitrate = min(320, track.bitrate)  # Clamp between 1-320
-            if original_bitrate != track.bitrate:
-                logging.info(f"Adjusted bitrate from {original_bitrate}kbps to {track.bitrate}kbps")
+            # Use the bitrate as-is, but clamp to reasonable range
+            track.bitrate = max(64, min(320, track.bitrate))
         elif track.downloaded_path.lower().endswith(('.flac', '.wav')):
-            track.bitrate = 320  # Use highest bitrate for lossless formats
+            track.bitrate = 256  # High quality for lossless formats
         else:
             track.bitrate = 192  # Default bitrate for most formats
         
@@ -63,44 +60,58 @@ class MusicPlayback:
                 else:
                     speed = 100  # Default to normal speed
             
-            # Apply speed filter if not 100%
+            # Apply speed filter with optimized approach
             speed_filter = ""
-            if speed != 100:
+            if speed != 100 and 50 <= speed <= 200:
                 speed_value = speed / 100.0
-                # Use atempo filter for speed adjustment (with multi-stage for large changes)
-                if speed_value > 2.0:
-                    # FFmpeg atempo filter is limited to 0.5-2.0 range, so we chain filters
-                    speed_filter = f"-filter:a \"atempo=2.0,atempo={speed_value/2.0}\""
-                elif speed_value < 0.5:
-                    # Similarly for very slow speeds
-                    speed_filter = f"-filter:a \"atempo=0.5,atempo={speed_value/0.5}\""
-                else:
-                    speed_filter = f"-filter:a \"atempo={speed_value}\""
+                
+                # Optimize filter based on speed value
+                if 0.5 <= speed_value <= 2.0:
+                    # Single atempo filter - most efficient
+                    speed_filter = f"-filter:a atempo={speed_value}"
+                elif speed_value > 2.0:
+                    # Chain filters for speeds above 2x
+                    # Break into multiple 2x filters for efficiency
+                    remaining_speed = speed_value
+                    filters = []
+                    while remaining_speed > 2.0:
+                        filters.append("atempo=2.0")
+                        remaining_speed /= 2.0
+                    filters.append(f"atempo={remaining_speed}")
+                    speed_filter = f"-filter:a \"{','.join(filters)}\""
+                else:  # speed_value < 0.5
+                    # Chain filters for very slow speeds
+                    remaining_speed = speed_value
+                    filters = []
+                    while remaining_speed < 0.5:
+                        filters.append("atempo=0.5")
+                        remaining_speed /= 0.5
+                    filters.append(f"atempo={remaining_speed}")
+                    speed_filter = f"-filter:a \"{','.join(filters)}\""
             
-            # Handle various file formats including MP4
-            ffmpeg_options = f'-vn -b:a {track.bitrate}k {speed_filter}'
+            # Optimized FFmpeg options with better buffering
+            ffmpeg_options = (
+                f'-vn '  # No video
+                f'-b:a {track.bitrate}k '  # Audio bitrate
+                f'-bufsize 512k '  # Buffer size for smoother playback
+                f'{speed_filter}'  # Speed filter if applicable
+            ).strip()
             
-            if track.downloaded_path.lower().endswith('.mp4'):
-                audio_source = discord.FFmpegPCMAudio(
-                    track.downloaded_path,
-                    before_options=options,
-                    executable=self.ffmpeg_path,
-                    options=ffmpeg_options.strip()  # Extract audio and set bitrate
-                )
-            else:
-                audio_source = discord.FFmpegPCMAudio(
-                    track.downloaded_path,
-                    before_options=options,
-                    executable=self.ffmpeg_path,
-                    options=ffmpeg_options.strip()  # Set bitrate for audio
-                )
+            # Create audio source based on file type
+            audio_source = discord.FFmpegPCMAudio(
+                track.downloaded_path,
+                before_options=before_options,
+                executable=self.ffmpeg_path,
+                options=ffmpeg_options
+            )
             
-            logging.info(f"Created audio source with bitrate: {track.bitrate}k and speed: {speed}%")
+            logging.info(f"Created audio source: bitrate={track.bitrate}kbps, speed={speed}%")
             
             # Start tracking playback position
             track.start_playback(start_time)
             
             return discord.PCMVolumeTransformer(audio_source, volume=track.volume / 100)
+            
         except Exception as e:
             logging.error(f"Error creating audio source: {e}")
             raise
@@ -118,34 +129,39 @@ class MusicPlayback:
                 logging.warning(f"Channel {guild_state.last_channel_id} not found")
                 return
 
-            # Calculate current position - using the get_current_position method
-            current_position = guild_state.current_track.get_current_position()
+            # Get current track
+            current_track = guild_state.current_track
+            if not current_track:
+                return
+
+            # Calculate current position
+            current_position = current_track.get_current_position()
             
             # Create the progress bar
             progress_bar = self.music_ui.create_progress_bar(
                 current_position,
-                guild_state.current_track.duration
+                current_track.duration
             )
             
             # Get the current speed setting
             speed = self.db.get_playback_speed(guild.id)
-            speed_emoji = "🐌" if speed < 100 else "🚀" if speed > 100 else "⏱️"
+            speed_emoji = "ðŸŒ" if speed < 100 else "ðŸš€" if speed > 100 else "â±ï¸"
             
             # Create the embed
             embed = self.music_ui.create_embed(
                 f"{self.music_ui.emoji['play']} Now Playing",
-                f"{self.music_ui.emoji['music']} **Track:** {guild_state.current_track.filename}\n"
-                f"{self.music_ui.emoji['microphone']} **Requested by:** {guild_state.current_track.requester}\n"
-                f"{self.music_ui.emoji['time']} **Duration:** {self.music_ui.format_duration(int(guild_state.current_track.duration))}\n"
-                f"🎚️ **Bitrate:** {guild_state.current_track.bitrate}kbps\n"
+                f"{self.music_ui.emoji['music']} **Track:** {current_track.filename}\n"
+                f"{self.music_ui.emoji['microphone']} **Requested by:** {current_track.requester}\n"
+                f"{self.music_ui.emoji['time']} **Duration:** {self.music_ui.format_duration(int(current_track.duration))}\n"
+                f"ðŸŽšï¸ **Bitrate:** {current_track.bitrate}kbps\n"
                 f"{speed_emoji} **Speed:** {speed}%\n"
                 f"**Progress:** {progress_bar}",
                 discord.Color.green()
             )
             
             # Add queue information if there are more tracks
-            if guild_state.queue:
-                next_track = guild_state.queue[0]
+            if len(guild_state.queue) > guild_state.queue_position + 1:
+                next_track = guild_state.queue[guild_state.queue_position + 1]
                 embed.add_field(
                     name=f"{self.music_ui.emoji['queue']} Up Next",
                     value=f"{self.music_ui.emoji['music']} {next_track.filename}\n"
@@ -157,41 +173,67 @@ class MusicPlayback:
         except Exception as e:
             logging.error(f"Error sending now playing message: {e}")
     
-    async def play_next(self, guild, force_play=False):
-        """Play the next track in the queue"""
+    async def play_next(self, guild, force_play=False, advance=True):
+        """Play the next track in the queue
+        
+        Args:
+            guild: The guild to play in
+            force_play: Whether to override autoplay setting
+            advance: Whether to advance to next track (False when seeking to specific position)
+        """
         guild_state = await self.music_state.get_guild_state(guild.id)
         if guild_state.is_seeking:
             return
-                    
+        
+        # Early validation: check if queue is empty or position is invalid
+        if not guild_state.queue:
+            logging.info(f"Queue is empty in guild {guild.id}, skipping playback")
+            
+            # Mark previous file as inactive if it exists
+            current_track = guild_state.current_track
+            if current_track and current_track.downloaded_path:
+                self.track_manager.mark_file_inactive(current_track.downloaded_path)
+            
+            # Check autodisconnect setting
+            if self.db.get_autodisconnect_setting(guild.id):
+                voice_client = guild.voice_client
+                if voice_client and voice_client.is_connected():
+                    try:
+                        await voice_client.disconnect()
+                        logging.info(f"Auto-disconnected from guild {guild.id} due to empty queue")
+                    except Exception as e:
+                        logging.error(f"Error during auto-disconnect in guild {guild.id}: {e}")
+            return
+                        
         try:
-            # Handle looping - do this BEFORE cleaning up current track
-            if guild_state.loop_enabled and guild_state.current_track:
+            # Get current track before moving position
+            current_track = guild_state.current_track
+            
+            # Handle looping
+            if guild_state.loop_enabled and current_track:
                 # Check if we've reached max loops
                 if guild_state.max_loops is not None:
                     guild_state.loop_count += 1
                     if guild_state.loop_count >= guild_state.max_loops:
-                        guild_state.loop_enabled = False  # Disable loop after reaching max
+                        guild_state.loop_enabled = False
                         guild_state.loop_count = 0
                         guild_state.max_loops = None
-                    else:
-                        # Make a copy of current track for looping
-                        current_track = guild_state.current_track
-                        # Re-add current track to beginning of queue
-                        guild_state.queue.insert(0, current_track)
-                else:  # Infinite loop
-                    # Make a copy of current track for looping
-                    current_track = guild_state.current_track
-                    # Re-add current track to beginning of queue
-                    guild_state.queue.insert(0, current_track)
-            
-            # Clean up current track if exists
-            if guild_state.current_track and not guild_state.is_seeking:
-                self.track_manager.mark_file_inactive(guild_state.current_track.downloaded_path)
-                guild_state.current_track.cleanup()
-                guild_state.current_track = None
+                        # Move to next track
+                        if advance:
+                            guild_state.queue_position += 1
+                    # else: stay at current position for another loop
+                # else: infinite loop, stay at current position
+            else:
+                # Move to next track only if advance is True
+                if advance:
+                    guild_state.queue_position += 1
 
-            # Check if queue is empty
-            if not guild_state.queue:
+            # Check if we've reached the end of queue
+            if guild_state.queue_position >= len(guild_state.queue):
+                # Mark previous file as inactive if it exists
+                if current_track and current_track.downloaded_path:
+                    self.track_manager.mark_file_inactive(current_track.downloaded_path)
+                
                 # Check autodisconnect setting and handle disconnection
                 if self.db.get_autodisconnect_setting(guild.id):
                     voice_client = guild.voice_client
@@ -215,22 +257,33 @@ class MusicPlayback:
 
             # Get next track and handle download
             try:
-                guild_state.current_track = guild_state.queue.pop(0)
-                self.track_manager.mark_file_active(guild_state.current_track.downloaded_path)
+                next_track = guild_state.current_track  # This uses the property based on queue_position
+                
+                # Additional safety check
+                if not next_track:
+                    logging.error(f"next_track is None in guild {guild.id} at position {guild_state.queue_position}")
+                    return
+                
+                # Mark previous file as inactive if different from next
+                if current_track and current_track != next_track and current_track.downloaded_path:
+                    self.track_manager.mark_file_inactive(current_track.downloaded_path)
+                
+                # Mark new file as active
+                if next_track.downloaded_path:
+                    self.track_manager.mark_file_active(next_track.downloaded_path)
                 
                 # Download if not already downloaded
-                if not guild_state.current_track.downloaded_path:
+                if not next_track.downloaded_path:
                     await self.track_manager.ensure_temp_folder()
-                    await guild_state.current_track.download(self.bot.config['temp_folder'])
+                    await next_track.download(self.bot.config['temp_folder'])
                     
                 # Update last activity time
                 guild_state.last_activity = time.time()
                 
             except Exception as e:
-                logging.error(f"Failed to prepare next track in guild {guild.id}: {e}")
-                if guild_state.current_track:
-                    self.track_manager.mark_file_inactive(guild_state.current_track.downloaded_path)
-                guild_state.current_track = None
+                logging.error(f"Failed to prepare track at position {guild_state.queue_position} in guild {guild.id}: {e}")
+                if next_track and next_track.downloaded_path:
+                    self.track_manager.mark_file_inactive(next_track.downloaded_path)
                 # Try to play next track in queue if this one fails
                 await self.play_next(guild, force_play)
                 return
@@ -247,8 +300,8 @@ class MusicPlayback:
                 speed = self.db.get_playback_speed(guild.id)
                 
                 audio_source = self.get_pcm_audio(
-                    guild_state.current_track, 
-                    guild_state.current_track.position,
+                    next_track, 
+                    next_track.position,
                     speed
                 )
                 
@@ -257,9 +310,8 @@ class MusicPlayback:
                 
             except Exception as e:
                 logging.error(f"Error creating audio source in guild {guild.id}: {e}")
-                if guild_state.current_track:
-                    self.track_manager.mark_file_inactive(guild_state.current_track.downloaded_path)
-                guild_state.current_track = None
+                if next_track and next_track.downloaded_path:
+                    self.track_manager.mark_file_inactive(next_track.downloaded_path)
                 # Try to play next track in queue if this one fails
                 await self.play_next(guild, force_play)
                 return
@@ -272,17 +324,21 @@ class MusicPlayback:
                 # Reset alone timer if it exists
                 self.music_state.alone_since.pop(guild.id, None)
                 
-                if not guild_state.is_seeking:
+                # Update the last activity timestamp
+                guild_state.last_activity = time.time()
+                
+                # Don't auto-advance if we're seeking or manually seeking queue
+                if not guild_state.is_seeking and not guild_state.manual_queue_seek:
                     # Schedule next track
                     asyncio.run_coroutine_threadsafe(
                         self.play_next(guild), 
                         self.bot.loop
                     )
-
+                    
             # Start playback
             try:
                 voice_client.play(audio_source, after=after_playing)
-                logging.info(f"Started playing '{guild_state.current_track.filename}' in guild {guild.id}")
+                logging.info(f"Started playing '{next_track.filename}' (position {guild_state.queue_position + 1}/{len(guild_state.queue)}) in guild {guild.id}")
                 
                 # Reset alone timer if it exists since we're actively playing
                 self.music_state.alone_since.pop(guild.id, None)
@@ -293,9 +349,8 @@ class MusicPlayback:
                 
             except Exception as e:
                 logging.error(f"Error starting playback in guild {guild.id}: {e}")
-                if guild_state.current_track:
-                    self.track_manager.mark_file_inactive(guild_state.current_track.downloaded_path)
-                guild_state.current_track = None
+                if next_track and next_track.downloaded_path:
+                    self.track_manager.mark_file_inactive(next_track.downloaded_path)
                 # Try to play next track in queue if this one fails
                 await self.play_next(guild, force_play)
                 return
@@ -304,9 +359,8 @@ class MusicPlayback:
             logging.error(f"Unexpected error in play_next for guild {guild.id}: {e}")
             # Clean up if there was an error
             try:
-                if guild_state.current_track:
-                    self.track_manager.mark_file_inactive(guild_state.current_track.downloaded_path)
-                    guild_state.current_track.cleanup()
-                    guild_state.current_track = None
+                current = guild_state.current_track
+                if current and current.downloaded_path:
+                    self.track_manager.mark_file_inactive(current.downloaded_path)
             except Exception as cleanup_error:
                 logging.error(f"Error during cleanup after playback failure in guild {guild.id}: {cleanup_error}")
