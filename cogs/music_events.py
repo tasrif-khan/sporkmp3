@@ -2,7 +2,13 @@ import discord
 import asyncio
 import logging
 import time
+import re
+import aiohttp
+import os
+from urllib.parse import urlparse
 from utils.track_manager import AudioTrack
+from utils.permission_checker import PermissionChecker
+from utils.voice_handler import VoiceConnectionHandler
 
 class MusicEvents:
     """Handles Discord event listeners for the music bot"""
@@ -13,7 +19,24 @@ class MusicEvents:
         self.music_state = music_state
         self.music_ui = music_ui
         self.music_playback = music_playback
+        self.voice_handler = VoiceConnectionHandler(bot)
     
+    async def track_playback_activity(self):
+        """Update activity timestamps for guilds with active playback"""
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    if guild.voice_client and guild.voice_client.is_playing():
+                        guild_state = await self.music_state.get_guild_state(guild.id)
+                        guild_state.last_activity = time.time()
+                        logging.debug(f"Updated activity timestamp for guild {guild.id} during playback")
+                
+                # Check every 15 minutes
+                await asyncio.sleep(900)
+            except Exception as e:
+                logging.error(f"Error in track_playback_activity: {e}")
+                await asyncio.sleep(60)
+
     async def periodic_cleanup(self):
         """Cleanup inactive guilds, temporary files, and stale alone timers"""
         while True:
@@ -39,10 +62,10 @@ class MusicEvents:
                         logging.error(f"Error cleaning up alone timer for guild {guild_id}: {e}")
                         error_count += 1
 
-                # 2. Clean up inactive guilds (1 hour threshold)
+                # 2. Clean up inactive guilds (3 hour threshold)
                 for guild_id, state in list(self.music_state.guild_states.items()):
                     try:
-                        if current_time - state.last_activity > 3600:  # 1 hour
+                        if current_time - state.last_activity > 10800:  # 3 hours
                             # Clean up voice client if still connected
                             guild = self.bot.get_guild(guild_id)
                             if guild and guild.voice_client:
@@ -83,6 +106,20 @@ class MusicEvents:
                     logging.error(f"Error cleaning up temporary files: {e}")
                     error_count += 1
 
+                # 5. Validate persistent files every hour
+                try:
+                    if hasattr(self, '_last_file_validation'):
+                        if current_time - self._last_file_validation > 3600:  # 1 hour
+                            orphaned_count = self.db.validate_persistent_files()
+                            if orphaned_count > 0:
+                                logging.info(f"Periodic file validation: cleaned {orphaned_count} orphaned entries")
+                            self._last_file_validation = current_time
+                    else:
+                        self._last_file_validation = current_time
+                except Exception as e:
+                    logging.error(f"Error in periodic file validation: {e}")
+                    error_count += 1
+
                 # Log cleanup summary if anything was cleaned
                 if inactive_guilds or cleaned_files or error_count:
                     logging.info(
@@ -112,32 +149,60 @@ class MusicEvents:
                 if len(before.channel.members) == 1:
                     # Record the time when bot was left alone
                     self.music_state.alone_since[before.channel.guild.id] = time.time()
-                    
-                    # Wait 5 minutes before checking again
-                    await asyncio.sleep(300)  # 300 seconds = 5 minutes
-                    
-                    # Check if we're still alone after 5 minutes
-                    current_voice_client = before.channel.guild.voice_client
-                    if (current_voice_client and 
-                        current_voice_client.channel == before.channel and 
-                        len(before.channel.members) == 1):
-                        
-                        await current_voice_client.disconnect()
-                        guild_state = await self.music_state.get_guild_state(before.channel.guild.id)
-                        if guild_state.current_track:
-                            guild_state.current_track.cleanup()
-                        for track in guild_state.queue:
-                            track.cleanup()
-                        guild_state.queue.clear()
-                        
-                        # Clean up the alone_since entry
-                        self.music_state.alone_since.pop(before.channel.guild.id, None)
+                    logging.info(f"Bot left alone in guild {before.channel.guild.id}, starting 5-minute timer")
                 else:
                     # If we're not alone anymore, remove the alone_since entry
-                    self.music_state.alone_since.pop(before.channel.guild.id, None)
-    
+                    if before.channel.guild.id in self.music_state.alone_since:
+                        self.music_state.alone_since.pop(before.channel.guild.id, None)
+                        logging.info(f"Bot no longer alone in guild {before.channel.guild.id}, cancelling timer")
+
+    async def extract_discord_cdn_urls(self, message_content):
+        """Extract Discord CDN URLs from message content"""
+        # Improved pattern to match Discord CDN URLs with query parameters
+        cdn_pattern = r'https://cdn\.discordapp\.com/attachments/\d+/\d+/[^?\s]+(?:\?[^\s]*)?'
+        urls = re.findall(cdn_pattern, message_content)
+        
+        # Debug logging
+        logging.info(f"Searching for CDN URLs in message: {message_content}")
+        logging.info(f"Found {len(urls)} potential CDN URLs: {urls}")
+        
+        validated_urls = []
+        SUPPORTED_FORMATS = ('.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.mp4')
+        
+        for url in urls:
+            # Extract filename from URL (ignore query parameters)
+            parsed_url = urlparse(url)
+            filename = os.path.basename(parsed_url.path)
+            
+            logging.info(f"Processing URL: {url}")
+            logging.info(f"Extracted filename: {filename}")
+            
+            # Check if it's a supported audio format
+            if any(filename.lower().endswith(fmt) for fmt in SUPPORTED_FORMATS):
+                try:
+                    # Get file size with HEAD request
+                    async with aiohttp.ClientSession() as session:
+                        async with session.head(url) as resp:
+                            if resp.status == 200:
+                                file_size = int(resp.headers.get('content-length', 0))
+                                validated_urls.append({
+                                    'url': url,
+                                    'filename': filename,
+                                    'size': file_size
+                                })
+                                logging.info(f"Successfully validated Discord CDN audio file: {filename} ({file_size} bytes)")
+                            else:
+                                logging.warning(f"Could not access Discord CDN URL: {url} (status: {resp.status})")
+                except Exception as e:
+                    logging.error(f"Error processing Discord CDN URL {url}: {e}")
+            else:
+                logging.info(f"Skipping non-audio file: {filename}")
+        
+        logging.info(f"Final validated URLs: {len(validated_urls)} files")
+        return validated_urls
+
     async def on_message(self, message):
-        """Handle file uploads when bot is mentioned"""
+        """Enhanced message handler with permission checking and Discord CDN URL support"""
         if message.author.bot:
             return
 
@@ -148,160 +213,125 @@ class MusicEvents:
                 guild_state = await self.music_state.get_guild_state(message.guild.id)
                 guild_state.last_channel_id = message.channel.id
                 
-                # Check bot permissions first
-                if not message.channel.permissions_for(message.guild.me).send_messages:
-                    logging.warning(f"Missing send message permissions in channel {message.channel.id}")
+                # Check text permissions first
+                missing_text_perms = PermissionChecker.check_text_permissions(message.channel, message.guild.me)
+                if missing_text_perms:
+                    # Can't send embeds, try basic message if we have send_messages permission
+                    if "Send Messages" not in missing_text_perms:
+                        try:
+                            await message.channel.send("❌ I'm missing required permissions to function properly.")
+                        except:
+                            pass
                     return
 
-                # Check if bot can embed links
-                can_embed = message.channel.permissions_for(message.guild.me).embed_links
-                
                 # Check if user is in voice channel
                 if not message.author.voice:
-                    if can_embed:
-                        embed = self.music_ui.create_embed(
-                            f"{self.music_ui.emoji['warning']} Voice Channel Required",
-                            "You need to be in a voice channel to use this command!",
-                            discord.Color.yellow()
-                        )
-                        await message.channel.send(embed=embed)
-                    else:
-                        await message.channel.send("❗ You need to be in a voice channel to use this command!")
+                    embed = self.music_ui.create_embed(
+                        f"{self.music_ui.emoji['warning']} Voice Channel Required",
+                        "You need to be in a voice channel to use this command!",
+                        discord.Color.yellow()
+                    )
+                    await message.channel.send(embed=embed)
                     return
 
-                # Check if there are attachments
-                if not message.attachments:
-                    if can_embed:
-                        embed = self.music_ui.create_embed(
-                            f"{self.music_ui.emoji['warning']} No Files Attached",
-                            "Please attach audio files when mentioning the bot.",
-                            discord.Color.yellow()
-                        )
-                        await message.channel.send(embed=embed)
-                    else:
-                        await message.channel.send("❗ Please attach audio files when mentioning the bot.")
-                    return
-
-                # Define supported audio formats
-                SUPPORTED_FORMATS = ('.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.mp4')
-                audio_attachments = [
-                    att for att in message.attachments 
-                    if any(att.filename.lower().endswith(fmt) for fmt in SUPPORTED_FORMATS)
-                ]
-
-                if not audio_attachments:
-                    if can_embed:
-                        embed = self.music_ui.create_embed(
-                            f"{self.music_ui.emoji['error']} Invalid File Type",
-                            f"Please provide audio files in one of these formats: {', '.join(SUPPORTED_FORMATS)}",
-                            discord.Color.red()
-                        )
-                        await message.channel.send(embed=embed)
-                    else:
-                        await message.channel.send(f"❌ Please provide supported audio files: {', '.join(SUPPORTED_FORMATS)}")
-                    return
-
-                # Get guild state
-                guild_state = await self.music_state.get_guild_state(message.guild.id)
+                voice_channel = message.author.voice.channel
                 
+                # Check voice permissions
+                missing_voice_perms = PermissionChecker.check_voice_permissions(voice_channel, message.guild.me)
+                if missing_voice_perms:
+                    embed = PermissionChecker.get_permission_error_embed(missing_voice_perms, "voice")
+                    await message.channel.send(embed=embed)
+                    return
+
+                # Combine regular attachments and Discord CDN URLs
+                all_audio_files = []
+                
+                # Process regular attachments
+                SUPPORTED_FORMATS = ('.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.mp4')
+                if message.attachments:
+                    audio_attachments = [
+                        att for att in message.attachments 
+                        if any(att.filename.lower().endswith(fmt) for fmt in SUPPORTED_FORMATS)
+                    ]
+                    
+                    for att in audio_attachments:
+                        all_audio_files.append({
+                            'url': att.url,
+                            'filename': att.filename,
+                            'size': att.size
+                        })
+
+                # Process Discord CDN URLs from message content
+                cdn_urls = await self.extract_discord_cdn_urls(message.content)
+                all_audio_files.extend(cdn_urls)
+
+                if not all_audio_files:
+                    embed = self.music_ui.create_embed(
+                        f"{self.music_ui.emoji['warning']} No Audio Files Found",
+                        f"Please attach audio files or provide Discord CDN links to audio files when mentioning the bot.\n\n"
+                        f"**Supported formats:** {', '.join(SUPPORTED_FORMATS)}",
+                        discord.Color.yellow()
+                    )
+                    await message.channel.send(embed=embed)
+                    return
+
                 # Calculate total size of all audio files
-                total_size = sum(att.size for att in audio_attachments)
+                total_size = sum(file_info['size'] for file_info in all_audio_files)
                 
                 # Check queue size limits
                 if not self.track_manager.can_add_to_queue(guild_state.queue, total_size):
                     current_size_mb = self.track_manager.get_queue_size(guild_state.queue) / (1024 * 1024)
-                    if can_embed:
-                        embed = self.music_ui.create_embed(
-                            f"{self.music_ui.emoji['warning']} Queue Full",
-                            f"Queue size limit reached! Current size: {current_size_mb:.1f}MB",
-                            discord.Color.yellow()
-                        )
-                        await message.channel.send(embed=embed)
-                    else:
-                        await message.channel.send(f"❗ Queue size limit reached! Current size: {current_size_mb:.1f}MB")
-                    return
-
-                # Check voice channel permissions
-                if not message.author.voice.channel.permissions_for(message.guild.me).connect:
-                    if can_embed:
-                        embed = self.music_ui.create_embed(
-                            f"{self.music_ui.emoji['error']} Missing Permissions",
-                            "I don't have permission to join the voice channel!",
-                            discord.Color.red()
-                        )
-                        await message.channel.send(embed=embed)
-                    else:
-                        await message.channel.send("❌ I don't have permission to join the voice channel!")
-                    return
-
-                if not message.author.voice.channel.permissions_for(message.guild.me).speak:
-                    if can_embed:
-                        embed = self.music_ui.create_embed(
-                            f"{self.music_ui.emoji['error']} Missing Permissions",
-                            "I don't have permission to speak in the voice channel!",
-                            discord.Color.red()
-                        )
-                        await message.channel.send(embed=embed)
-                    else:
-                        await message.channel.send("❌ I don't have permission to speak in the voice channel!")
+                    embed = self.music_ui.create_embed(
+                        f"{self.music_ui.emoji['warning']} Queue Full",
+                        f"Queue size limit reached! Current size: {current_size_mb:.1f}MB",
+                        discord.Color.yellow()
+                    )
+                    await message.channel.send(embed=embed)
                     return
 
                 # Add all tracks to queue
                 added_tracks = []
                 skipped_tracks = []
-                for attachment in audio_attachments:
+                for file_info in all_audio_files:
                     try:
                         # Create track
                         track = AudioTrack(
-                            attachment.url,
-                            attachment.filename,
+                            file_info['url'],
+                            file_info['filename'],
                             message.author.display_name,
-                            attachment.size
+                            file_info['size'],
+                            is_permanent=False
                         )
                         
                         # Add to queue
                         guild_state.queue.append(track)
-                        added_tracks.append(attachment.filename)
+                        added_tracks.append(file_info['filename'])
                     except Exception as e:
-                        logging.error(f"Error adding track {attachment.filename}: {e}")
-                        skipped_tracks.append(attachment.filename)
+                        logging.error(f"Error adding track {file_info['filename']}: {e}")
+                        skipped_tracks.append(file_info['filename'])
 
                 # Prepare and send status message
-                if can_embed:
-                    # Prepare status message for embed
-                    status_message = []
-                    if added_tracks:
-                        status_message.append(f"✅ Added {len(added_tracks)} tracks to queue:")
-                        for i, track in enumerate(added_tracks, 1):
-                            status_message.append(f"{i}. {track}")
+                status_message = []
+                if added_tracks:
+                    status_message.append(f"✅ Added {len(added_tracks)} tracks to queue:")
+                    for i, track in enumerate(added_tracks, 1):
+                        status_message.append(f"{i}. {track}")
 
-                    if skipped_tracks:
-                        status_message.append(f"\n❌ Failed to add {len(skipped_tracks)} tracks:")
-                        for track in skipped_tracks:
-                            status_message.append(f"• {track}")
+                if skipped_tracks:
+                    status_message.append(f"\n❌ Failed to add {len(skipped_tracks)} tracks:")
+                    for track in skipped_tracks:
+                        status_message.append(f"• {track}")
 
-                    current_size_mb = self.track_manager.get_queue_size(guild_state.queue) / (1024 * 1024)
-                    max_size_mb = self.bot.config['max_queue_size_mb']
-                    status_message.append(f"\n{self.music_ui.emoji['cd']} Queue Size: {current_size_mb:.1f}MB / {max_size_mb}MB")
+                current_size_mb = self.track_manager.get_queue_size(guild_state.queue) / (1024 * 1024)
+                max_size_mb = self.bot.config['max_queue_size_mb']
+                status_message.append(f"\n{self.music_ui.emoji['cd']} Queue Size: {current_size_mb:.1f}MB / {max_size_mb}MB")
 
-                    embed = self.music_ui.create_embed(
-                        f"{self.music_ui.emoji['success']} Batch Upload Complete",
-                        "\n".join(status_message),
-                        discord.Color.green()
-                    )
-                    await message.channel.send(embed=embed)
-                else:
-                    # Prepare simple text status message
-                    status_message = []
-                    if added_tracks:
-                        status_message.append(f"✅ Added {len(added_tracks)} tracks to queue")
-                    if skipped_tracks:
-                        status_message.append(f"❌ Failed to add {len(skipped_tracks)} tracks")
-                    
-                    current_size_mb = self.track_manager.get_queue_size(guild_state.queue) / (1024 * 1024)
-                    status_message.append(f"📀 Queue Size: {current_size_mb:.1f}MB")
-                    
-                    await message.channel.send("\n".join(status_message))
+                embed = self.music_ui.create_embed(
+                    f"{self.music_ui.emoji['success']} Batch Upload Complete",
+                    "\n".join(status_message),
+                    discord.Color.green()
+                )
+                await message.channel.send(embed=embed)
 
                 # Increment upload count and check if we should ask for a rating
                 if added_tracks:
@@ -325,48 +355,70 @@ class MusicEvents:
                         self.db.reset_upload_count(message.guild.id)
                         self.db.update_last_rating_request(message.guild.id, current_time)
                         
-                        if can_embed:
-                            rating_embed = self.music_ui.create_embed(
-                                f"{self.music_ui.emoji['success']} Enjoying SporkMP3?",
-                                "If you're enjoying the bot, please consider rating us on top.gg!\n"
-                                "Your support helps more people discover the bot.\n\n"
-                                "[Rate SporkMP3 on top.gg](https://top.gg/bot/1318106283760680970)",
-                                discord.Color.gold()
-                            )
-                            await message.channel.send(embed=rating_embed)
-                        else:
-                            await message.channel.send("Enjoying SporkMP3? Please consider rating us: https://top.gg/bot/1318106283760680970")
+                        rating_embed = self.music_ui.create_embed(
+                            f"{self.music_ui.emoji['success']} Enjoying SporkMP3?",
+                            "If you're enjoying the bot, please consider rating us on top.gg!\n"
+                            "Your support helps more people discover the bot.\n\n"
+                            "[Rate SporkMP3 on top.gg](https://top.gg/bot/1318106283760680970)",
+                            discord.Color.gold()
+                        )
+                        await message.channel.send(embed=rating_embed)
+
+                # Ensure queue position is valid before attempting playback
+                if guild_state.queue_position >= len(guild_state.queue):
+                    guild_state.queue_position = -1
+                    logging.warning(f"Reset invalid queue_position for guild {message.guild.id}")
 
                 # Connect to voice channel if not already connected
                 if not message.guild.voice_client and added_tracks:
                     try:
-                        await message.author.voice.channel.connect()
-                        # Check autoplay setting before starting playback
-                        if self.db.get_autoplay_setting(message.guild.id):
-                            await self.music_playback.play_next(message.guild)
+                        # Check rate limit before attempting connection
+                        current_time = time.time()
+                        if message.guild.id in self.voice_handler.last_attempt_time:
+                            time_since_last = current_time - self.voice_handler.last_attempt_time[message.guild.id]
+                            if time_since_last < 30:  # 30 second rate limit
+                                wait_time = int(30 - time_since_last)
+                                embed = self.music_ui.create_embed(
+                                    f"{self.music_ui.emoji['warning']} Connection Rate Limited",
+                                    f"Please wait **{wait_time} seconds** before reconnecting to voice.\n\n"
+                                    f"**Tip:** Files have been added to queue. Use `/play` to start playback after the cooldown.",
+                                    discord.Color.yellow()
+                                )
+                                await message.channel.send(embed=embed)
+                                return
+                        
+                        voice_client = await self.voice_handler.connect_with_retry(voice_channel)
+                        if voice_client:
+                            # Check autoplay setting before starting playback
+                            if self.db.get_autoplay_setting(message.guild.id):
+                                await self.music_playback.play_next(message.guild)
+                        else:
+                            embed = self.music_ui.create_embed(
+                                f"{self.music_ui.emoji['error']} Connection Failed",
+                                "Failed to connect to voice channel after multiple attempts.\n\n"
+                                f"**Files added to queue:** Use `/play` to retry playback.",
+                                discord.Color.red()
+                            )
+                            await message.channel.send(embed=embed)
                     except discord.Forbidden:
                         logging.error("Failed to connect to voice channel - Missing permissions")
-                        if can_embed:
-                            embed = self.music_ui.create_embed(
-                                f"{self.music_ui.emoji['error']} Connection Error",
-                                "Failed to connect to voice channel due to missing permissions!",
-                                discord.Color.red()
-                            )
-                            await message.channel.send(embed=embed)
-                        else:
-                            await message.channel.send("❌ Failed to connect to voice channel due to missing permissions!")
+                        embed = self.music_ui.create_embed(
+                            f"{self.music_ui.emoji['error']} Connection Error",
+                            "Failed to connect to voice channel due to missing permissions!",
+                            discord.Color.red()
+                        )
+                        await message.channel.send(embed=embed)
                     except Exception as e:
                         logging.error(f"Error connecting to voice channel: {e}")
-                        if can_embed:
-                            embed = self.music_ui.create_embed(
-                                f"{self.music_ui.emoji['error']} Connection Error",
-                                "Failed to connect to voice channel!",
-                                discord.Color.red()
-                            )
-                            await message.channel.send(embed=embed)
-                        else:
-                            await message.channel.send("❌ Failed to connect to voice channel!")
+                        embed = self.music_ui.create_embed(
+                            f"{self.music_ui.emoji['error']} Connection Error",
+                            "Failed to connect to voice channel!\n\n"
+                            f"**Files added to queue:** Use `/play` to retry playback.",
+                            discord.Color.red()
+                        )
+                        await message.channel.send(embed=embed)
                         return
+
                 # If already connected and nothing is playing, start playback if autoplay is enabled
                 elif (message.guild.voice_client and 
                     not message.guild.voice_client.is_playing() and 
@@ -381,15 +433,12 @@ class MusicEvents:
             except Exception as e:
                 logging.error(f"Error in batch upload handler: {e}")
                 try:
-                    if can_embed:
-                        embed = self.music_ui.create_embed(
-                            f"{self.music_ui.emoji['error']} Error",
-                            "An unexpected error occurred while processing your request.",
-                            discord.Color.red()
-                        )
-                        await message.channel.send(embed=embed)
-                    else:
-                        await message.channel.send("❌ An unexpected error occurred while processing your request.")
+                    embed = self.music_ui.create_embed(
+                        f"{self.music_ui.emoji['error']} Error",
+                        "An unexpected error occurred while processing your request.",
+                        discord.Color.red()
+                    )
+                    await message.channel.send(embed=embed)
                 except:
                     logging.error("Failed to send error message")
                 

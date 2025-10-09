@@ -16,6 +16,7 @@ from .music_commands import MusicCommands
 # Import utilities
 from utils.track_manager import TrackManager
 from utils.database_manager import DatabaseManager
+from utils.health_monitor import HealthMonitor
 
 class Music(commands.Cog):
     """Main music bot cog that coordinates all components"""
@@ -56,9 +57,12 @@ class Music(commands.Cog):
         self.music_playback = MusicPlayback(bot, self.track_manager, self.music_state, self.db, self.music_ui)
         self.music_events = MusicEvents(bot, self.db, self.track_manager, self.music_state, self.music_ui, self.music_playback)
         self.music_commands = MusicCommands(bot, self.db, self.track_manager, self.music_state, self.music_ui, self.music_playback)
+        self.health_monitor = HealthMonitor(bot)
         
         # Set up event handlers
         self.bot.loop.create_task(self.music_events.periodic_cleanup())
+        self.bot.loop.create_task(self.music_events.track_playback_activity())
+        self.bot.loop.create_task(self.health_monitor.monitor_voice_connections())
         
         logging.info("Music extension loaded successfully")
     
@@ -68,6 +72,7 @@ class Music(commands.Cog):
         try:
             await self.track_manager.ensure_temp_folder()
             await self.track_manager.cleanup_temp_files()
+            logging.info("Music cog initialization completed")
         except Exception as e:
             logging.error(f"Error during cog initialization: {e}")
     
@@ -82,13 +87,13 @@ class Music(commands.Cog):
             
             # Cleanup all tracks
             for guild_id, state in self.music_state.guild_states.items():
-                if state.current_track:
-                    state.current_track.cleanup()
                 for track in state.queue:
-                    track.cleanup()
+                    if not track.is_permanent:
+                        track.cleanup()
             
             # Final cleanup of temp files
             await self.track_manager.cleanup_temp_files()
+            logging.info("Music cog cleanup completed")
         except Exception as e:
             logging.error(f"Error during cog cleanup: {e}")
     
@@ -138,13 +143,20 @@ class Music(commands.Cog):
     async def autoplay(self, interaction: discord.Interaction, enabled: bool):
         await self.update_last_channel(interaction)
         await self.music_commands.autoplay(interaction, enabled)
+
+    @app_commands.command(name="health", description="Check bot health status")
+    @admin_only()
+    async def health(self, interaction: discord.Interaction):
+        await self.update_last_channel(interaction)
+        await self.music_commands.health(interaction)
     
     # User commands
-    @app_commands.command(name="play", description="Play the current loaded MP3")
+    @app_commands.command(name="play", description="Play a track from queue or from the sound library")
+    @app_commands.describe(name="Optional: Name of the sound from the library to play")
     @check_permissions()
-    async def play(self, interaction: discord.Interaction):
+    async def play(self, interaction: discord.Interaction, name: str = None):
         await self.update_last_channel(interaction)
-        await self.music_commands.play(interaction)
+        await self.music_commands.play(interaction, name)
     
     @app_commands.command(name="pause", description="Pause the current song")
     @check_permissions()
@@ -163,6 +175,13 @@ class Music(commands.Cog):
     async def queue(self, interaction: discord.Interaction):
         await self.update_last_channel(interaction)
         await self.music_commands.queue(interaction)
+    
+    @app_commands.command(name="seekqueue", description="Jump to a specific position in the queue")
+    @app_commands.describe(position="Queue position to jump to (1 = first track)")
+    @check_permissions()
+    async def seekqueue(self, interaction: discord.Interaction, position: int):
+        await self.update_last_channel(interaction)
+        await self.music_commands.seekqueue(interaction, position)
     
     @app_commands.command(name="playing", description="Show what's currently playing")
     @check_permissions()
@@ -206,7 +225,7 @@ class Music(commands.Cog):
         await self.update_last_channel(interaction)
         await self.music_commands.skip(interaction)
     
-    @app_commands.command(name="clear", description="Clear the queue")
+    @app_commands.command(name="clear", description="Clear the entire queue and stop playback")
     @check_permissions()
     async def clear(self, interaction: discord.Interaction):
         await self.update_last_channel(interaction)
@@ -236,6 +255,24 @@ class Music(commands.Cog):
     async def remove(self, interaction: discord.Interaction, position: int):
         await self.update_last_channel(interaction)
         await self.music_commands.remove(interaction, position)
+    
+    @app_commands.command(name="upload", description="Upload a sound to the server's permanent library")
+    @check_permissions()
+    async def upload(self, interaction: discord.Interaction, name: str, file: discord.Attachment = None):
+        await self.update_last_channel(interaction)
+        await self.music_commands.upload(interaction, name, file)
+
+    @app_commands.command(name="library", description="List all sounds in the server's sound library")
+    @check_permissions()
+    async def library(self, interaction: discord.Interaction):
+        await self.update_last_channel(interaction)
+        await self.music_commands.library(interaction)
+    
+    @app_commands.command(name="remove_sound", description="Remove a sound from the server's library")
+    @check_permissions()
+    async def remove_sound(self, interaction: discord.Interaction, name: str):
+        await self.update_last_channel(interaction)
+        await self.music_commands.remove_sound(interaction, name)
     
     @app_commands.command(name="help", description="Show all available commands")
     async def help(self, interaction: discord.Interaction):

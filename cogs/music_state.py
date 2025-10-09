@@ -6,14 +6,33 @@ class GuildState:
     """Stores the state for a specific guild"""
     def __init__(self):
         self.queue = []
-        self.current_track = None
+        self.queue_position = -1  # -1 means nothing playing, 0+ is index in queue
         self.volume = 100
-        self.is_seeking = False
+        self.is_seeking = False  # For timestamp/forward/backward seeking
+        self.manual_queue_seek = False  # For /seekqueue command
         self.last_activity = time.time()
         self.loop_enabled = False
         self.loop_count = 0
         self.max_loops = None  # None means infinite loop
         self.last_channel_id = None  # Track the last channel used for music commands
+    
+    @property
+    def current_track(self):
+        """Get the current track based on queue position"""
+        if 0 <= self.queue_position < len(self.queue):
+            return self.queue[self.queue_position]
+        return None
+    
+    def reset_playback_state(self):
+        """Reset all playback-related state (keeps settings like volume and last_channel)"""
+        self.queue.clear()
+        self.queue_position = -1
+        self.loop_enabled = False
+        self.loop_count = 0
+        self.max_loops = None
+        self.is_seeking = False
+        self.manual_queue_seek = False
+        logging.info("Reset playback state")
 
 class MusicState:
     """Manages music state across all guilds"""
