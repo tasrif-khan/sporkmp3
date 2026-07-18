@@ -549,6 +549,14 @@ async def ensure_playable(file_path: str, temp_folder: str) -> Tuple[str, bool]:
         force_convert = True
         codec = 'usac'  # override so convert_to_compatible picks the right decoder
 
+    # mp4/webm containers may carry video streams or malformed stream metadata
+    # (e.g. "timescale not set") that cause FFmpegPCMAudio to fail even with -vn.
+    # Always extract to a clean audio file for these containers.
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ('.mp4', '.webm') and not force_convert:
+        logging.info(f"Video container ({ext}), forcing audio extraction: {os.path.basename(file_path)}")
+        force_convert = True
+
     if not force_convert and not needs_conversion(codec):
         return file_path, False
 

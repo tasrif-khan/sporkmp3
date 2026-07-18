@@ -6,10 +6,13 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import asyncio
+import io
 import logging
 import time
 import os
 import re
+import struct
+import zlib
 import aiohttp
 from datetime import timedelta
 
@@ -28,72 +31,104 @@ from utils import (
 # ============================================================================
 
 
-class NowPlayingView(discord.ui.View):
-    """Persistent Now Playing embed with playback control buttons"""
+class PlayerHubView(discord.ui.View):
+    """Unified player hub — transport controls + Library / Playlists / Queue navigation."""
 
     def __init__(self, music_cog, guild: discord.Guild):
         super().__init__(timeout=3600)
         self.music_cog = music_cog
-        self.guild = guild
-        self._refresh_buttons()
+        self.guild     = guild
+        self._rebuild()
 
-    def _refresh_buttons(self):
+    def _rebuild(self):
         self.clear_items()
-        vc = self.guild.voice_client
+        vc    = self.guild.voice_client
         state = self.music_cog.state.guild_states.get(self.guild.id)
 
-        is_paused  = bool(vc and vc.is_paused())
-        is_active  = bool(vc and (vc.is_playing() or vc.is_paused()))
-        at_start   = not state or state.queue_position <= 0
-        at_end     = not state or state.queue_position >= len(state.queue) - 1
-        loop_on    = bool(state and state.loop_enabled)
+        is_paused = bool(vc and vc.is_paused())
+        is_active = bool(vc and (vc.is_playing() or vc.is_paused()))
+        at_start  = not state or state.queue_position <= 0
+        at_end    = not state or state.queue_position >= len(state.queue) - 1
+        loop_on   = bool(state and state.loop_enabled)
+        has_queue = bool(state and state.queue)
 
-        # ── Transport controls ─────────────────────────────────────────────
-        b = discord.ui.Button(emoji="⏮️", style=discord.ButtonStyle.secondary,
+        # ── Row 0: Transport ─────────────────────────────────────────────────
+        b = discord.ui.Button(label="◀◀", style=discord.ButtonStyle.secondary,
                               disabled=at_start or not is_active, row=0)
         b.callback = self._on_previous
         self.add_item(b)
 
         b = discord.ui.Button(
-            emoji="▶️" if is_paused else "⏸️",
-            style=discord.ButtonStyle.success if is_paused else discord.ButtonStyle.secondary,
-            disabled=not is_active, row=0
+            label="▶" if (is_paused or not is_active) else "‖",
+            style=discord.ButtonStyle.success if (is_paused or (has_queue and not is_active))
+                  else discord.ButtonStyle.secondary,
+            disabled=not has_queue, row=0
         )
-        b.callback = self._on_pause_resume
+        b.callback = self._on_play_pause
         self.add_item(b)
 
-        b = discord.ui.Button(emoji="⏹️", style=discord.ButtonStyle.danger,
+        b = discord.ui.Button(label="■", style=discord.ButtonStyle.danger,
                               disabled=not is_active, row=0)
         b.callback = self._on_stop
         self.add_item(b)
 
-        b = discord.ui.Button(emoji="⏭️", style=discord.ButtonStyle.secondary,
+        b = discord.ui.Button(label="▶▶", style=discord.ButtonStyle.secondary,
                               disabled=at_end or not is_active, row=0)
         b.callback = self._on_skip
         self.add_item(b)
 
         b = discord.ui.Button(
-            emoji="🔄",
+            label="↻",
             style=discord.ButtonStyle.success if loop_on else discord.ButtonStyle.secondary,
-            row=0
+            disabled=not is_active, row=0
         )
         b.callback = self._on_loop
         self.add_item(b)
 
-    # ---- helpers ----
+        # ── Row 1: Navigation ────────────────────────────────────────────────
+        b = discord.ui.Button(label="Library", style=discord.ButtonStyle.primary, row=1)
+        b.callback = self._open_library
+        self.add_item(b)
 
+        b = discord.ui.Button(label="Playlists", style=discord.ButtonStyle.primary, row=1)
+        b.callback = self._open_playlists
+        self.add_item(b)
+
+        b = discord.ui.Button(label="Queue", style=discord.ButtonStyle.secondary,
+                              disabled=not has_queue, row=1)
+        b.callback = self._open_queue
+        self.add_item(b)
+
+    def build_embed(self) -> discord.Embed:
+        state = self.music_cog.state.guild_states.get(self.guild.id)
+        if state and state.current_track:
+            return self.music_cog._build_now_playing_embed(self.guild, state)
+
+        embed = create_embed(color=Colors.PRIMARY)
+        embed.title = f"{EMOJI['music']} SporkMP3"
+        if state and state.queue and state.is_stopped:
+            embed.description = (
+                f"{EMOJI['stop']} **Stopped** — {len(state.queue)} track(s) queued.\n"
+                "Press ▶ to resume, or browse below."
+            )
+        else:
+            embed.description = (
+                "Nothing playing yet.\n"
+                "Open **Library** to queue tracks, or load a **Playlist** to get started.\n"
+                "You can also mention me with an audio file to queue it directly."
+            )
+        return embed
+
+    # ── Permission check ──────────────────────────────────────────────────────
     async def _check_perms(self, interaction: discord.Interaction) -> bool:
         mc = self.music_cog
-
-        # Must be in the same voice channel as the bot
         vc = self.guild.voice_client
         if vc and vc.channel:
             if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
                 await interaction.response.send_message(
-                    embed=error_embed("You must be in the voice channel to control playback."),
+                    embed=error_embed("You must be in the same voice channel to control playback."),
                     ephemeral=True)
                 return False
-
         if interaction.user.guild_permissions.administrator:
             return True
         if mc.db.is_blacklisted(interaction.guild_id, interaction.user.id):
@@ -110,38 +145,57 @@ class NowPlayingView(discord.ui.View):
         return True
 
     async def _edit_in_place(self, interaction: discord.Interaction):
-        """Rebuild buttons + embed and edit this message"""
+        self._rebuild()
+        embed = self.build_embed()
         state = self.music_cog.state.guild_states.get(self.guild.id)
-        self._refresh_buttons()
-        if state and state.current_track:
-            embed = self.music_cog._build_now_playing_embed(self.guild, state)
-        else:
-            embed = create_embed(color=Colors.PRIMARY)
-            embed.title = f"{EMOJI['stop']} Stopped"
-            embed.description = "Playback stopped. Queue is intact — use `/play` to resume."
+        track = state.current_track if state else None
+        if track and track.cover_url:
+            # File attachment is still on this message — reference it directly
+            embed.set_thumbnail(url="attachment://cover.png")
         await interaction.response.edit_message(embed=embed, view=self)
 
-    # ---- button callbacks ----
-
-    async def _on_pause_resume(self, interaction: discord.Interaction):
+    # ── Transport callbacks ───────────────────────────────────────────────────
+    async def _on_play_pause(self, interaction: discord.Interaction):
         if not await self._check_perms(interaction):
             return
-        vc = self.guild.voice_client
+        vc    = self.guild.voice_client
         state = self.music_cog.state.guild_states.get(self.guild.id)
+
         if vc and vc.is_playing():
             if state and state.current_track:
                 state.current_track.pause_playback()
             vc.pause()
+            await self._edit_in_place(interaction)
         elif vc and vc.is_paused():
             if state and state.current_track:
                 state.current_track.resume_playback()
             vc.resume()
-        await self._edit_in_place(interaction)
+            await self._edit_in_place(interaction)
+        elif state and state.queue:
+            if not interaction.user.voice:
+                await interaction.response.send_message(
+                    embed=warning_embed("Join a voice channel first!"), ephemeral=True)
+                return
+            if not vc:
+                vc = await self.music_cog.voice.connect(interaction.user.voice.channel)
+                if not vc:
+                    await interaction.response.send_message(
+                        embed=error_embed("Failed to connect to voice channel."), ephemeral=True)
+                    return
+            state.is_stopped = False
+            if state.queue_position < 0:
+                state.queue_position = 0
+            await interaction.response.defer()
+            await self.music_cog._play_next(self.guild, force=True, advance=False)
+        else:
+            await interaction.response.send_message(
+                embed=warning_embed("Nothing in queue — browse **Library** or **Playlists** first."),
+                ephemeral=True)
 
     async def _on_stop(self, interaction: discord.Interaction):
         if not await self._check_perms(interaction):
             return
-        vc = self.guild.voice_client
+        vc    = self.guild.voice_client
         state = self.music_cog.state.guild_states.get(self.guild.id)
         if vc and (vc.is_playing() or vc.is_paused()):
             if state:
@@ -168,19 +222,14 @@ class NowPlayingView(discord.ui.View):
                 embed=warning_embed("No more tracks in queue!"), ephemeral=True)
             return
 
-        # Defer immediately so Discord doesn't time out while we do async work
         await interaction.response.defer()
-
-        # Take manual control — prevents after-callback from also advancing
-        state.loop_enabled     = False
-        state.loop_count       = 0
-        state.max_loops        = None
+        state.loop_enabled      = False
+        state.loop_count        = 0
+        state.max_loops         = None
         state.manual_queue_seek = True
         state.queue_position   += 1
-
         vc.stop()
         await asyncio.sleep(0.3)
-
         await self.music_cog._play_next(self.guild, force=True, advance=False)
         state.manual_queue_seek = False
 
@@ -196,17 +245,14 @@ class NowPlayingView(discord.ui.View):
             return
 
         await interaction.response.defer()
-
         state.loop_enabled      = False
         state.loop_count        = 0
         state.max_loops         = None
         state.manual_queue_seek = True
         state.queue_position   -= 1
-
         if vc and (vc.is_playing() or vc.is_paused()):
             vc.stop()
         await asyncio.sleep(0.3)
-
         await self.music_cog._play_next(self.guild, force=True, advance=False)
         state.manual_queue_seek = False
 
@@ -218,11 +264,36 @@ class NowPlayingView(discord.ui.View):
             state.loop_enabled = not state.loop_enabled
             if not state.loop_enabled:
                 state.loop_count = 0
-                state.max_loops = None
+                state.max_loops  = None
         await self._edit_in_place(interaction)
 
+    # ── Navigation callbacks ──────────────────────────────────────────────────
+    async def _open_library(self, interaction: discord.Interaction):
+        state = self.music_cog.state.guild_states.get(self.guild.id)
+        if state:
+            state.last_channel_id = interaction.channel_id
+        tracks = self.music_cog.db.list_tracks(self.guild.id)
+        view   = LibraryView(tracks, self.guild.id, self.music_cog, from_hub=True)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view, attachments=[])
+
+    async def _open_playlists(self, interaction: discord.Interaction):
+        state = self.music_cog.state.guild_states.get(self.guild.id)
+        if state:
+            state.last_channel_id = interaction.channel_id
+        view = PlaylistManagerView(self.music_cog, self.guild, interaction.user, from_hub=True)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view, attachments=[])
+
+    async def _open_queue(self, interaction: discord.Interaction):
+        state = self.music_cog.state.guild_states.get(self.guild.id)
+        if not state or not state.queue:
+            await interaction.response.send_message(
+                embed=warning_embed("Queue is empty!"), ephemeral=True)
+            return
+        cur_page = max(0, state.queue_position // QueueView.TRACKS_PER_PAGE)
+        view     = QueueView(state, self.music_cog, self.guild, page=cur_page, from_hub=True)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view, attachments=[])
+
     async def on_timeout(self):
-        """Disable all buttons when the view expires"""
         self.clear_items()
         state = self.music_cog.state.guild_states.get(self.guild.id)
         if state and state.last_np_message:
@@ -230,6 +301,205 @@ class NowPlayingView(discord.ui.View):
                 await state.last_np_message.edit(view=self)
             except Exception:
                 pass
+
+
+class LibraryURLUploadModal(discord.ui.Modal, title="Upload URL to Library"):
+    """Admin modal for saving an audio URL directly to the library."""
+
+    track_name = discord.ui.TextInput(label="Track Name", placeholder="e.g. My Song", max_length=50)
+    track_url  = discord.ui.TextInput(label="Audio URL",  placeholder="https://...", max_length=500)
+
+    def __init__(self, music_cog, guild: discord.Guild):
+        super().__init__()
+        self.music_cog = music_cog
+        self.guild     = guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.track_name.value.strip()
+        url  = self.track_url.value.strip()
+
+        if not url.startswith(('http://', 'https://')):
+            await interaction.response.send_message(
+                embed=error_embed("URL must start with http:// or https://"), ephemeral=True)
+            return
+        if self.music_cog.db.get_track(self.guild.id, name):
+            await interaction.response.send_message(
+                embed=warning_embed(f"**{name}** already exists in library!"), ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            embed=info_embed("Downloading…", f"{EMOJI['loading']} Saving **{name}** to library…"),
+            ephemeral=True)
+
+        ALLOWED_EXTS = {'.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.mp4', '.webm'}
+        filename = url.split('/')[-1].split('?')[0]
+        ext = os.path.splitext(filename)[1].lower()
+        if not ext:
+            for ae in ALLOWED_EXTS:
+                if ae in url.lower():
+                    ext = ae; filename = f"{name}{ext}"; break
+            else:
+                ext = '.mp3'; filename = f"{name}.mp3"
+
+        if ext not in ALLOWED_EXTS:
+            await interaction.followup.send(
+                embed=error_embed(f"Unsupported format. Supported: {', '.join(ALLOWED_EXTS)}"),
+                ephemeral=True)
+            return
+
+        perm_folder = 'permanent'
+        os.makedirs(perm_folder, exist_ok=True)
+        safe = ''.join(c for c in filename if c.isalnum() or c in '._- ')
+        path = os.path.join(perm_folder, f"{self.guild.id}_{safe}")
+
+        try:
+            file_size = 0
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.head(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        file_size = int(r.headers.get('content-length', 0))
+                except Exception:
+                    file_size = 5 * 1024 * 1024
+
+            if not self.music_cog.db.can_store(self.guild.id, file_size or 5 * 1024 * 1024):
+                storage = self.music_cog.db.get_storage(self.guild.id)
+                await interaction.followup.send(embed=error_embed(
+                    f"Storage full! {storage['used']/1024/1024:.1f}MB / {storage['max']/1024/1024:.1f}MB"),
+                    ephemeral=True)
+                return
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send(
+                            embed=error_embed(f"Download failed (HTTP {resp.status})"), ephemeral=True)
+                        return
+                    with open(path, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+
+            actual_size = os.path.getsize(path)
+            self.music_cog.db.add_track(self.guild.id, name, filename, path,
+                                         interaction.user.display_name, actual_size)
+            await interaction.followup.send(embed=success_embed(
+                "Saved to Library",
+                f"{EMOJI['music']} **{name}** saved ({actual_size/1024/1024:.1f}MB). "
+                f"Open **Library** in the player to queue it."),
+                ephemeral=True)
+        except Exception as e:
+            if os.path.exists(path):
+                os.remove(path)
+            await interaction.followup.send(
+                embed=error_embed(f"Upload failed: {str(e)[:100]}"), ephemeral=True)
+
+
+class LibraryRemoveView(discord.ui.View):
+    """Admin view for removing tracks from the library."""
+
+    TRACKS_PER_PAGE = 20
+
+    def __init__(self, tracks: list, guild_id: int, music_cog, page: int = 0):
+        super().__init__(timeout=300)
+        self.all_tracks = tracks
+        self.guild_id   = guild_id
+        self.music_cog  = music_cog
+        self.page       = page
+        self.max_page   = max(0, (len(tracks) - 1) // self.TRACKS_PER_PAGE) if tracks else 0
+        self._rebuild()
+
+    def _page_tracks(self):
+        s = self.page * self.TRACKS_PER_PAGE
+        return self.all_tracks[s:s + self.TRACKS_PER_PAGE]
+
+    def _rebuild(self):
+        self.clear_items()
+        page_tracks = self._page_tracks()
+
+        if page_tracks:
+            options = [
+                discord.SelectOption(
+                    label=t['track_name'][:100],
+                    description=f"{t['filename'][:50]} · {t['file_size']/1024/1024:.1f}MB",
+                    value=t['track_name']
+                ) for t in page_tracks[:25]
+            ]
+            sel = discord.ui.Select(placeholder="Select tracks to remove…",
+                                    options=options, min_values=1,
+                                    max_values=min(len(options), 5), row=0)
+            sel.callback = self._on_remove
+            self.add_item(sel)
+
+        if self.max_page > 0:
+            b = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary,
+                                  disabled=(self.page == 0), row=1)
+            b.callback = self._prev
+            self.add_item(b)
+            self.add_item(discord.ui.Button(label=f"Page {self.page+1}/{self.max_page+1}",
+                                             style=discord.ButtonStyle.primary, disabled=True, row=1))
+            b = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary,
+                                  disabled=(self.page >= self.max_page), row=1)
+            b.callback = self._next
+            self.add_item(b)
+
+        b = discord.ui.Button(label="← Back to Library", style=discord.ButtonStyle.secondary, row=2)
+        b.callback = self._on_back
+        self.add_item(b)
+
+    def build_embed(self) -> discord.Embed:
+        embed = create_embed(color=Colors.WARNING)
+        embed.title = "Remove from Library"
+        embed.description = (
+            f"Select tracks to permanently remove.\n"
+            f"**{len(self.all_tracks)}** track(s) in library."
+        )
+        page_tracks = self._page_tracks()
+        start_idx   = self.page * self.TRACKS_PER_PAGE
+        lines = [
+            f"`{start_idx + i + 1}.` **{t['track_name']}** › {t['file_size']/1024/1024:.1f}MB"
+            for i, t in enumerate(page_tracks)
+        ]
+        if lines:
+            embed.add_field(name="Tracks", value="\n".join(lines), inline=False)
+        return embed
+
+    async def _on_remove(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(embed=error_embed("Admin only."), ephemeral=True)
+            return
+        removed = []
+        for name in interaction.data['values']:
+            file_path = self.music_cog.db.remove_track(interaction.guild_id, name)
+            if file_path:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                removed.append(name)
+                self.all_tracks = [t for t in self.all_tracks if t['track_name'] != name]
+        self.max_page = max(0, (len(self.all_tracks) - 1) // self.TRACKS_PER_PAGE) if self.all_tracks else 0
+        self.page     = min(self.page, self.max_page)
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        if removed:
+            await interaction.followup.send(
+                embed=success_embed("Removed", f"Removed {len(removed)} track(s) from library."),
+                ephemeral=True)
+
+    async def _prev(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page = min(self.max_page, self.page + 1)
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_back(self, interaction: discord.Interaction):
+        tracks = self.music_cog.db.list_tracks(interaction.guild_id)
+        view   = LibraryView(tracks, interaction.guild_id, self.music_cog, from_hub=True)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    async def on_timeout(self):
+        self.clear_items()
 
 
 class LibrarySelect(discord.ui.Select):
@@ -298,11 +568,12 @@ class LibrarySelect(discord.ui.Select):
                 )
                 return
         
-        if not interaction.guild.voice_client.is_playing():
+        vc = interaction.guild.voice_client
+        if not vc.is_playing() and not vc.is_paused():
             if state.queue_position < 0:
                 state.queue_position = 0
             await self.music_cog._play_next(interaction.guild, force=True, advance=False)
-        
+
         names_str = ", ".join(f"**{n}**" for n in added)
         await interaction.followup.send(
             embed=success_embed("Added to Queue", f"{EMOJI['music']} {names_str}"),
@@ -312,74 +583,128 @@ class LibrarySelect(discord.ui.Select):
 
 class LibraryView(discord.ui.View):
     """Paginated library browser with track select dropdown"""
-    
+
     TRACKS_PER_PAGE = 10
-    
-    def __init__(self, tracks: list, guild_id: int, music_cog, page: int = 0):
+
+    def __init__(self, tracks: list, guild_id: int, music_cog, page: int = 0,
+                 from_hub: bool = False):
         super().__init__(timeout=120)
         self.all_tracks = tracks
-        self.guild_id = guild_id
-        self.music_cog = music_cog
-        self.page = page
-        self.max_page = max(0, (len(tracks) - 1) // self.TRACKS_PER_PAGE)
+        self.guild_id   = guild_id
+        self.music_cog  = music_cog
+        self.page       = page
+        self.from_hub   = from_hub
+        self.max_page   = max(0, (len(tracks) - 1) // self.TRACKS_PER_PAGE)
         self._update_components()
-    
+
     def _page_tracks(self):
         start = self.page * self.TRACKS_PER_PAGE
         return self.all_tracks[start:start + self.TRACKS_PER_PAGE]
-    
+
     def _update_components(self):
         self.clear_items()
         page_tracks = self._page_tracks()
+
+        # Row 0: queue track dropdown
         if page_tracks:
             self.add_item(LibrarySelect(page_tracks, self.page, self.music_cog))
+
+        # Row 1: pagination
         if self.max_page > 0:
-            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, disabled=self.page == 0)
+            prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary,
+                                         disabled=self.page == 0, row=1)
             prev_btn.callback = self._prev
             self.add_item(prev_btn)
-            
-            page_btn = discord.ui.Button(label=f"{self.page + 1}/{self.max_page + 1}", style=discord.ButtonStyle.primary, disabled=True)
-            self.add_item(page_btn)
-            
-            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=self.page >= self.max_page)
+            self.add_item(discord.ui.Button(label=f"{self.page + 1}/{self.max_page + 1}",
+                                             style=discord.ButtonStyle.primary, disabled=True, row=1))
+            next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary,
+                                          disabled=self.page >= self.max_page, row=1)
             next_btn.callback = self._next
             self.add_item(next_btn)
-    
-    def _build_embed(self):
+
+        # Row 2: navigation + admin controls (hub mode only)
+        if self.from_hub:
+            b = discord.ui.Button(label="← Back to Player",
+                                  style=discord.ButtonStyle.secondary, row=2)
+            b.callback = self._on_back
+            self.add_item(b)
+
+            b = discord.ui.Button(label="↑ Upload URL",
+                                  style=discord.ButtonStyle.secondary, row=2)
+            b.callback = self._on_upload_url
+            self.add_item(b)
+
+            if self.all_tracks:
+                b = discord.ui.Button(label="Remove Track",
+                                      style=discord.ButtonStyle.danger, row=2)
+                b.callback = self._on_remove
+                self.add_item(b)
+
+    def build_embed(self):
         page_tracks = self._page_tracks()
         embed = create_embed(color=Colors.PRIMARY)
         embed.title = f"{EMOJI['cd']} Sound Library"
-        
+
         lines = []
         start_idx = self.page * self.TRACKS_PER_PAGE
         for i, t in enumerate(page_tracks):
             size_mb = t['file_size'] / 1024 / 1024
-            lines.append(f"`{start_idx + i + 1}.` **{t['track_name']}** › `{t['filename'][:30]}` ({size_mb:.1f}MB)")
-        
-        embed.description = "\n".join(lines) if lines else "No tracks found."
-        
+            lines.append(f"`{start_idx + i + 1}.` **{t['track_name']}** › "
+                         f"`{t['filename'][:30]}` ({size_mb:.1f}MB)")
+
+        embed.description = "\n".join(lines) if lines else (
+            "Library is empty.\nUse **↑ Upload URL** to add tracks (admins only)."
+        )
+
         storage = self.music_cog.db.get_storage(self.guild_id)
-        used_mb = storage['used'] / 1024 / 1024
-        max_mb = storage['max'] / 1024 / 1024
-        percent = (used_mb / max_mb * 100) if max_mb > 0 else 0
+        used_mb  = storage['used'] / 1024 / 1024
+        max_mb   = storage['max'] / 1024 / 1024
+        percent  = (used_mb / max_mb * 100) if max_mb > 0 else 0
         embed.add_field(
             name="Storage",
             value=f"**{used_mb:.1f}MB** / {max_mb:.1f}MB ({percent:.0f}%) • {len(self.all_tracks)} track(s)",
             inline=False
         )
-        embed.set_footer(text="Select tracks from the dropdown to add to queue")
+        footer = "Select tracks from the dropdown to add to queue"
+        if self.from_hub:
+            footer += " • Admins: Upload URL · Remove tracks"
+        embed.set_footer(text=footer)
         return embed
-    
+
     async def _prev(self, interaction: discord.Interaction):
         self.page = max(0, self.page - 1)
         self._update_components()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
-    
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
     async def _next(self, interaction: discord.Interaction):
         self.page = min(self.max_page, self.page + 1)
         self._update_components()
-        await interaction.response.edit_message(embed=self._build_embed(), view=self)
-    
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_back(self, interaction: discord.Interaction):
+        view  = PlayerHubView(self.music_cog, interaction.guild)
+        embed = view.build_embed()
+        state = self.music_cog.state.guild_states.get(interaction.guild_id)
+        track = state.current_track if state else None
+        if track and track.cover_url:
+            embed.set_thumbnail(url=track.cover_url)
+        await interaction.response.edit_message(embed=embed, view=view, attachments=[])
+
+    async def _on_upload_url(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(embed=error_embed("Admin only."), ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            LibraryURLUploadModal(self.music_cog, interaction.guild))
+
+    async def _on_remove(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(embed=error_embed("Admin only."), ephemeral=True)
+            return
+        tracks = self.music_cog.db.list_tracks(interaction.guild_id)
+        view   = LibraryRemoveView(tracks, interaction.guild_id, self.music_cog)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
     async def on_timeout(self):
         self.clear_items()
 
@@ -415,7 +740,7 @@ class PlaylistCreateModal(discord.ui.Modal, title="Create Playlist"):
         if self.music_cog.db.create_playlist(self.guild.id, name, interaction.user.display_name, desc):
             await interaction.response.send_message(
                 embed=success_embed("Playlist Created",
-                    f"**{name}** is ready.\nHit **🔄 Refresh** in the manager to see it."),
+                    f"**{name}** is ready.\nHit **↻ Refresh** in the manager to see it."),
                 ephemeral=True
             )
         else:
@@ -427,12 +752,14 @@ class PlaylistCreateModal(discord.ui.Modal, title="Create Playlist"):
 class PlaylistManagerView(discord.ui.View):
     """Top-level playlist browser — select a playlist then act on it."""
 
-    def __init__(self, music_cog, guild: discord.Guild, invoker: discord.Member):
+    def __init__(self, music_cog, guild: discord.Guild, invoker: discord.Member,
+                 from_hub: bool = False):
         super().__init__(timeout=300)
         self.music_cog = music_cog
         self.guild     = guild
         self.invoker   = invoker
-        self.selected  = None   # currently selected playlist name
+        self.from_hub  = from_hub
+        self.selected  = None
         self._rebuild()
 
     def _is_admin(self, user: discord.Member) -> bool:
@@ -456,8 +783,7 @@ class PlaylistManagerView(discord.ui.View):
                     label=p['playlist_name'],
                     description=label_desc,
                     value=p['playlist_name'],
-                    default=(p['playlist_name'] == self.selected),
-                    emoji="🎵"
+                    default=(p['playlist_name'] == self.selected)
                 ))
             sel = discord.ui.Select(placeholder="Select a playlist...", options=options, row=0)
             sel.callback = self._on_select
@@ -469,32 +795,38 @@ class PlaylistManagerView(discord.ui.View):
         b.callback = self._on_play_all
         self.add_item(b)
 
-        b = discord.ui.Button(label="👁 View Tracks", style=discord.ButtonStyle.primary,
+        b = discord.ui.Button(label="View Tracks", style=discord.ButtonStyle.primary,
                               disabled=not has_sel, row=1)
         b.callback = self._on_view
         self.add_item(b)
 
         if is_admin:
-            b = discord.ui.Button(label="➕ Add Tracks", style=discord.ButtonStyle.secondary,
+            b = discord.ui.Button(label="Add Tracks", style=discord.ButtonStyle.secondary,
                                   disabled=not has_sel, row=1)
             b.callback = self._on_add_tracks
             self.add_item(b)
 
-            b = discord.ui.Button(label="🗑 Delete", style=discord.ButtonStyle.danger,
+            b = discord.ui.Button(label="Delete", style=discord.ButtonStyle.danger,
                                   disabled=not has_sel, row=1)
             b.callback = self._on_delete
             self.add_item(b)
 
-        # ── Row 2: Create + Refresh ────────────────────────────────────────
+        # ── Row 2: Create + Refresh + Back ───────────────────────────────────
         if is_admin:
-            b = discord.ui.Button(label="➕ Create New Playlist",
+            b = discord.ui.Button(label="+ Create Playlist",
                                   style=discord.ButtonStyle.secondary, row=2)
             b.callback = self._on_create
             self.add_item(b)
 
-        b = discord.ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2)
+        b = discord.ui.Button(label="↻ Refresh", style=discord.ButtonStyle.secondary, row=2)
         b.callback = self._on_refresh
         self.add_item(b)
+
+        if self.from_hub:
+            b = discord.ui.Button(label="← Back to Player",
+                                  style=discord.ButtonStyle.secondary, row=2)
+            b.callback = self._on_back_to_hub
+            self.add_item(b)
 
     def build_embed(self) -> discord.Embed:
         playlists = self.music_cog.db.list_playlists(self.guild.id)
@@ -504,7 +836,7 @@ class PlaylistManagerView(discord.ui.View):
         if not playlists:
             embed.description = (
                 "No playlists yet.\n"
-                "Admins can create one with **➕ Create New Playlist**."
+                "Admins can create one with **+ Create Playlist**."
             )
             return embed
 
@@ -549,7 +881,8 @@ class PlaylistManagerView(discord.ui.View):
                 return
 
         state = self.music_cog.state.guild_states.get(self.guild.id)
-        if not interaction.guild.voice_client.is_playing() and state:
+        vc = interaction.guild.voice_client
+        if state and not vc.is_playing() and not vc.is_paused():
             if state.queue_position < 0:
                 state.queue_position = 0
             await self.music_cog._play_next(self.guild, force=True, advance=False)
@@ -564,7 +897,7 @@ class PlaylistManagerView(discord.ui.View):
         playlist = self.music_cog.db.get_playlist(self.guild.id, self.selected)
         tracks   = self.music_cog.db.get_playlist_tracks(self.guild.id, self.selected)
         view     = PlaylistDetailView(self.selected, playlist, tracks, self.music_cog,
-                                      self.guild, self.invoker)
+                                      self.guild, self.invoker, from_hub=self.from_hub)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _on_add_tracks(self, interaction: discord.Interaction):
@@ -589,9 +922,10 @@ class PlaylistManagerView(discord.ui.View):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(embed=error_embed("Admin only."), ephemeral=True)
             return
-        view  = PlaylistDeleteConfirmView(self.selected, self.music_cog, self.guild, self.invoker)
+        view  = PlaylistDeleteConfirmView(self.selected, self.music_cog, self.guild,
+                                          self.invoker, from_hub=self.from_hub)
         embed = create_embed(color=Colors.ERROR)
-        embed.title = "🗑 Delete Playlist"
+        embed.title = "Delete Playlist"
         embed.description = (f"Are you sure you want to delete **{self.selected}**?\n"
                              "This cannot be undone.")
         await interaction.response.edit_message(embed=embed, view=view)
@@ -606,6 +940,15 @@ class PlaylistManagerView(discord.ui.View):
         self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
+    async def _on_back_to_hub(self, interaction: discord.Interaction):
+        view  = PlayerHubView(self.music_cog, self.guild)
+        embed = view.build_embed()
+        state = self.music_cog.state.guild_states.get(self.guild.id)
+        track = state.current_track if state else None
+        if track and track.cover_url:
+            embed.set_thumbnail(url=track.cover_url)
+        await interaction.response.edit_message(embed=embed, view=view, attachments=[])
+
     async def on_timeout(self):
         self.clear_items()
 
@@ -613,12 +956,14 @@ class PlaylistManagerView(discord.ui.View):
 class PlaylistDeleteConfirmView(discord.ui.View):
     """Inline confirm/cancel for playlist deletion"""
 
-    def __init__(self, playlist_name: str, music_cog, guild: discord.Guild, invoker: discord.Member):
+    def __init__(self, playlist_name: str, music_cog, guild: discord.Guild,
+                 invoker: discord.Member, from_hub: bool = False):
         super().__init__(timeout=60)
         self.playlist_name = playlist_name
         self.music_cog     = music_cog
         self.guild         = guild
         self.invoker       = invoker
+        self.from_hub      = from_hub
 
         b = discord.ui.Button(label="Yes, delete it", style=discord.ButtonStyle.danger, row=0)
         b.callback = self._confirm
@@ -630,11 +975,13 @@ class PlaylistDeleteConfirmView(discord.ui.View):
 
     async def _confirm(self, interaction: discord.Interaction):
         self.music_cog.db.delete_playlist(self.guild.id, self.playlist_name)
-        view = PlaylistManagerView(self.music_cog, self.guild, self.invoker)
+        view = PlaylistManagerView(self.music_cog, self.guild, self.invoker,
+                                   from_hub=self.from_hub)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _cancel(self, interaction: discord.Interaction):
-        view = PlaylistManagerView(self.music_cog, self.guild, self.invoker)
+        view = PlaylistManagerView(self.music_cog, self.guild, self.invoker,
+                                   from_hub=self.from_hub)
         view.selected = self.playlist_name
         view._rebuild()
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
@@ -646,7 +993,8 @@ class PlaylistDetailView(discord.ui.View):
     TRACKS_PER_PAGE = 10
 
     def __init__(self, name: str, playlist: dict, tracks: list,
-                 music_cog, guild: discord.Guild, invoker: discord.Member, page: int = 0):
+                 music_cog, guild: discord.Guild, invoker: discord.Member,
+                 page: int = 0, from_hub: bool = False):
         super().__init__(timeout=300)
         self.name       = name
         self.playlist   = playlist or {}
@@ -655,6 +1003,7 @@ class PlaylistDetailView(discord.ui.View):
         self.guild      = guild
         self.invoker    = invoker
         self.page       = page
+        self.from_hub   = from_hub
         self.max_page   = max(0, (len(tracks) - 1) // self.TRACKS_PER_PAGE) if tracks else 0
         self._rebuild()
 
@@ -675,8 +1024,7 @@ class PlaylistDetailView(discord.ui.View):
                 options.append(discord.SelectOption(
                     label=t['track_name'][:100],
                     description=f"#{t['position']} · {size_mb:.1f}MB",
-                    value=t['track_name'],
-                    emoji="🎵"
+                    value=t['track_name']
                 ))
             sel = discord.ui.Select(
                 placeholder="Queue individual tracks...",
@@ -695,7 +1043,7 @@ class PlaylistDetailView(discord.ui.View):
         self.add_item(b)
 
         if is_admin:
-            b = discord.ui.Button(label="➕ Add Tracks", style=discord.ButtonStyle.secondary, row=1)
+            b = discord.ui.Button(label="Add Tracks", style=discord.ButtonStyle.secondary, row=1)
             b.callback = self._on_add_tracks
             self.add_item(b)
 
@@ -730,7 +1078,7 @@ class PlaylistDetailView(discord.ui.View):
         embed.description = f"*{desc}*\n\n" if desc else ""
 
         if not self.all_tracks:
-            embed.description += "This playlist is empty. Use **➕ Add Tracks** to populate it."
+            embed.description += "This playlist is empty. Use **Add Tracks** to populate it."
             return embed
 
         page_tracks = self._page_tracks()
@@ -795,7 +1143,8 @@ class PlaylistDetailView(discord.ui.View):
                 await interaction.followup.send(embed=error_embed("Failed to connect."), ephemeral=True)
                 return
 
-        if not self.guild.voice_client.is_playing():
+        vc = self.guild.voice_client
+        if not vc.is_playing() and not vc.is_paused():
             if state.queue_position < 0:
                 state.queue_position = 0
             await self.music_cog._play_next(self.guild, force=True, advance=False)
@@ -827,7 +1176,8 @@ class PlaylistDetailView(discord.ui.View):
                 return
 
         state = self.music_cog.state.guild_states.get(self.guild.id)
-        if not self.guild.voice_client.is_playing() and state:
+        vc = self.guild.voice_client
+        if state and not vc.is_playing() and not vc.is_paused():
             if state.queue_position < 0:
                 state.queue_position = 0
             await self.music_cog._play_next(self.guild, force=True, advance=False)
@@ -852,7 +1202,8 @@ class PlaylistDetailView(discord.ui.View):
                     "Every library track is already in this playlist."), ephemeral=True)
             return
 
-        view = PlaylistAddView(available, self.name, self.music_cog, self.guild, self.invoker)
+        view = PlaylistAddView(available, self.name, self.music_cog, self.guild,
+                               self.invoker, from_hub=self.from_hub)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def _prev(self, interaction: discord.Interaction):
@@ -866,7 +1217,8 @@ class PlaylistDetailView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     async def _on_back(self, interaction: discord.Interaction):
-        view          = PlaylistManagerView(self.music_cog, self.guild, self.invoker)
+        view          = PlaylistManagerView(self.music_cog, self.guild, self.invoker,
+                                            from_hub=self.from_hub)
         view.selected = self.name
         view._rebuild()
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
@@ -881,7 +1233,8 @@ class PlaylistAddView(discord.ui.View):
     TRACKS_PER_PAGE = 10
 
     def __init__(self, available: list, playlist_name: str,
-                 music_cog, guild: discord.Guild, invoker: discord.Member, page: int = 0):
+                 music_cog, guild: discord.Guild, invoker: discord.Member,
+                 page: int = 0, from_hub: bool = False):
         super().__init__(timeout=300)
         self.available     = available
         self.playlist_name = playlist_name
@@ -889,6 +1242,7 @@ class PlaylistAddView(discord.ui.View):
         self.guild         = guild
         self.invoker       = invoker
         self.page          = page
+        self.from_hub      = from_hub
         self.max_page      = max(0, (len(available) - 1) // self.TRACKS_PER_PAGE)
         self._rebuild()
 
@@ -908,8 +1262,7 @@ class PlaylistAddView(discord.ui.View):
                 options.append(discord.SelectOption(
                     label=t['track_name'][:100],
                     description=f"{t['filename'][:50]} · {size_mb:.1f}MB",
-                    value=t['track_name'],
-                    emoji="🎵"
+                    value=t['track_name']
                 ))
             sel = discord.ui.Select(
                 placeholder="Select tracks to add...",
@@ -946,7 +1299,7 @@ class PlaylistAddView(discord.ui.View):
 
     def build_embed(self) -> discord.Embed:
         embed = create_embed(color=Colors.PRIMARY)
-        embed.title = f"➕ Add Tracks to {self.playlist_name}"
+        embed.title = f"Add Tracks to {self.playlist_name}"
 
         page_tracks = self._page_tracks()
         start_idx   = self.page * self.TRACKS_PER_PAGE
@@ -1013,7 +1366,8 @@ class PlaylistAddView(discord.ui.View):
         playlist = self.music_cog.db.get_playlist(self.guild.id, self.playlist_name)
         tracks   = self.music_cog.db.get_playlist_tracks(self.guild.id, self.playlist_name)
         view     = PlaylistDetailView(self.playlist_name, playlist, tracks,
-                                      self.music_cog, self.guild, self.invoker)
+                                      self.music_cog, self.guild, self.invoker,
+                                      from_hub=self.from_hub)
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
     async def on_timeout(self):
@@ -1042,7 +1396,7 @@ class AccessConfigView(discord.ui.View):
 
         # ── Row 0: Add roles to whitelist ─────────────────────────────────
         role_sel = discord.ui.RoleSelect(
-            placeholder="➕ Add role to whitelist...",
+            placeholder="Add role to whitelist...",
             min_values=1,
             max_values=5,
             row=0
@@ -1057,11 +1411,10 @@ class AccessConfigView(discord.ui.View):
                 r = self.guild.get_role(rid)
                 options.append(discord.SelectOption(
                     label=r.name if r else f"Deleted role ({rid})",
-                    value=str(rid),
-                    emoji="🔐"
+                    value=str(rid)
                 ))
             rm_sel = discord.ui.Select(
-                placeholder="🗑 Remove role from whitelist...",
+                placeholder="Remove role from whitelist...",
                 options=options,
                 min_values=1,
                 max_values=min(len(options), 5),
@@ -1072,7 +1425,7 @@ class AccessConfigView(discord.ui.View):
 
         # ── Row 2: Add user to blacklist ───────────────────────────────────
         user_sel = discord.ui.UserSelect(
-            placeholder="🚫 Blacklist a user...",
+            placeholder="Blacklist a user...",
             min_values=1,
             max_values=5,
             row=2
@@ -1089,9 +1442,9 @@ class AccessConfigView(discord.ui.View):
             for uid in blacklisted[:25]:
                 member = self.guild.get_member(uid)
                 label  = member.display_name if member else f"User {uid}"
-                opts.append(discord.SelectOption(label=label, value=str(uid), emoji="🚫"))
+                opts.append(discord.SelectOption(label=label, value=str(uid)))
             unban_sel = discord.ui.Select(
-                placeholder="✅ Remove user from blacklist...",
+                placeholder="Remove user from blacklist...",
                 options=opts,
                 min_values=1,
                 max_values=min(len(opts), 5),
@@ -1116,7 +1469,7 @@ class AccessConfigView(discord.ui.View):
         blacklisted = db.get_blacklisted_users(gid) if hasattr(db, 'get_blacklisted_users') else []
 
         embed = create_embed(color=Colors.PRIMARY)
-        embed.title = "🔐 Access Control"
+        embed.title = "Access Control"
         embed.description = f"Manage who can use SporkMP3 in **{self.guild.name}**"
 
         # Role whitelist
@@ -1131,7 +1484,7 @@ class AccessConfigView(discord.ui.View):
         else:
             roles_val = "*No restrictions — everyone can use the bot*"
 
-        embed.add_field(name="🔐 Role Whitelist", value=roles_val, inline=False)
+        embed.add_field(name="Role Whitelist", value=roles_val, inline=False)
 
         # Blacklist
         if blacklisted:
@@ -1145,7 +1498,7 @@ class AccessConfigView(discord.ui.View):
         else:
             bl_val = "*No users blacklisted*"
 
-        embed.add_field(name="🚫 Blacklisted Users", value=bl_val, inline=False)
+        embed.add_field(name="Blacklisted Users", value=bl_val, inline=False)
 
         embed.set_footer(text="Role whitelist: if set, only those roles can use the bot • Admins are always exempt")
         return embed
@@ -1246,7 +1599,7 @@ class SettingsView(discord.ui.View):
 
         # ── Row 0: Toggle buttons ──────────────────────────────────────────
         b = discord.ui.Button(
-            label=f"Autoplay: {'ON ✅' if ap else 'OFF ❌'}",
+            label=f"Autoplay: {'ON' if ap else 'OFF'}",
             style=discord.ButtonStyle.success if ap else discord.ButtonStyle.secondary,
             row=0
         )
@@ -1254,7 +1607,7 @@ class SettingsView(discord.ui.View):
         self.add_item(b)
 
         b = discord.ui.Button(
-            label=f"Auto-disconnect: {'ON ✅' if ad else 'OFF ❌'}",
+            label=f"Auto-disconnect: {'ON' if ad else 'OFF'}",
             style=discord.ButtonStyle.success if ad else discord.ButtonStyle.secondary,
             row=0
         )
@@ -1272,7 +1625,7 @@ class SettingsView(discord.ui.View):
         self.add_item(spd_down)
 
         self.add_item(discord.ui.Button(
-            label=f"⚡ {spd}% Speed",
+            label=f"{spd}% Speed",
             style=discord.ButtonStyle.primary,
             disabled=True,
             row=1
@@ -1289,7 +1642,7 @@ class SettingsView(discord.ui.View):
 
         # ── Row 2: Access config + Refresh ────────────────────────────────
         b = discord.ui.Button(
-            label="🔐 Manage Access",
+            label="Manage Access",
             style=discord.ButtonStyle.primary,
             row=2
         )
@@ -1297,7 +1650,7 @@ class SettingsView(discord.ui.View):
         self.add_item(b)
 
         b = discord.ui.Button(
-            label="🔄 Refresh",
+            label="↻ Refresh",
             style=discord.ButtonStyle.secondary,
             row=2
         )
@@ -1323,10 +1676,10 @@ class SettingsView(discord.ui.View):
 
         # Playback
         embed.add_field(
-            name="▶️ Playback",
+            name="Playback",
             value=(
-                f"**Autoplay** › {'✅ On' if ap else '❌ Off'}\n"
-                f"**Auto-disconnect** › {'✅ On' if ad else '❌ Off'}\n"
+                f"**Autoplay** › {'On' if ap else 'Off'}\n"
+                f"**Auto-disconnect** › {'On' if ad else 'Off'}\n"
                 f"**Speed** › {spd}%"
             ),
             inline=True
@@ -1345,7 +1698,7 @@ class SettingsView(discord.ui.View):
             roles_val = "*Everyone (no restrictions)*"
 
         embed.add_field(
-            name="🔐 Access",
+            name="Access",
             value=f"**Whitelisted Roles**\n{roles_val}",
             inline=True
         )
@@ -1355,7 +1708,7 @@ class SettingsView(discord.ui.View):
         filled   = int((used_mb / max_mb) * bar_len) if max_mb > 0 else 0
         bar      = "█" * filled + "░" * (bar_len - filled)
         embed.add_field(
-            name="💾 Library Storage",
+            name="Storage",
             value=f"`{bar}` {pct:.0f}%\n{used_mb:.1f} MB / {max_mb:.0f} MB used",
             inline=False
         )
@@ -1418,16 +1771,18 @@ class SettingsView(discord.ui.View):
 # ============================================================================
 
 class QueueView(discord.ui.View):
-    """Paginated queue browser with jump-to select"""
+    """Paginated queue browser with jump-to, clear, and disconnect controls."""
 
     TRACKS_PER_PAGE = 10
 
-    def __init__(self, state, music_cog, guild: discord.Guild, page: int = 0):
+    def __init__(self, state, music_cog, guild: discord.Guild, page: int = 0,
+                 from_hub: bool = False):
         super().__init__(timeout=120)
         self.state      = state
         self.music_cog  = music_cog
         self.guild      = guild
         self.page       = page
+        self.from_hub   = from_hub
         self.max_page   = max(0, (len(state.queue) - 1) // self.TRACKS_PER_PAGE)
         self._rebuild()
 
@@ -1435,12 +1790,29 @@ class QueueView(discord.ui.View):
         s = self.page * self.TRACKS_PER_PAGE
         return self.state.queue[s:s + self.TRACKS_PER_PAGE]
 
+    async def _check_perms(self, interaction: discord.Interaction) -> bool:
+        mc = self.music_cog
+        if interaction.user.guild_permissions.administrator:
+            return True
+        if mc.db.is_blacklisted(interaction.guild_id, interaction.user.id):
+            await interaction.response.send_message(
+                embed=error_embed("You are blacklisted."), ephemeral=True)
+            return False
+        whitelisted = mc.db.get_whitelisted_roles(interaction.guild_id)
+        if whitelisted:
+            user_roles = {r.id for r in interaction.user.roles}
+            if not user_roles & set(whitelisted):
+                await interaction.response.send_message(
+                    embed=error_embed("You don't have the required role."), ephemeral=True)
+                return False
+        return True
+
     def _rebuild(self):
         self.clear_items()
         page_tracks = self._page_tracks()
         start_idx   = self.page * self.TRACKS_PER_PAGE
 
-        # ── Row 0: Jump-to select ──────────────────────────────────────────
+        # ── Row 0: Jump-to select ─────────────────────────────────────────
         if page_tracks:
             options = []
             for i, t in enumerate(page_tracks):
@@ -1454,13 +1826,13 @@ class QueueView(discord.ui.View):
                     label=f"{abs_i + 1}. {name}",
                     description=f"[{dur}] {'▶ Playing' if is_cur else ''}",
                     value=str(abs_i),
-                    emoji="▶️" if is_cur else None
+                    emoji="▶" if is_cur else None
                 ))
-            sel = discord.ui.Select(placeholder="Jump to track...", options=options, row=0)
+            sel = discord.ui.Select(placeholder="Jump to track…", options=options, row=0)
             sel.callback = self._on_jump
             self.add_item(sel)
 
-        # ── Row 1: Pagination ──────────────────────────────────────────────
+        # ── Row 1: Pagination ─────────────────────────────────────────────
         if self.max_page > 0:
             b = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary,
                                   disabled=(self.page == 0), row=1)
@@ -1469,13 +1841,28 @@ class QueueView(discord.ui.View):
 
             self.add_item(discord.ui.Button(
                 label=f"Page {self.page+1}/{self.max_page+1}",
-                style=discord.ButtonStyle.primary,
-                disabled=True, row=1
+                style=discord.ButtonStyle.primary, disabled=True, row=1
             ))
 
             b = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary,
                                   disabled=(self.page >= self.max_page), row=1)
             b.callback = self._next
+            self.add_item(b)
+
+        # ── Row 2: Actions ────────────────────────────────────────────────
+        b = discord.ui.Button(label="Clear Queue", style=discord.ButtonStyle.danger, row=2)
+        b.callback = self._on_clear
+        self.add_item(b)
+
+        b = discord.ui.Button(label="Disconnect", style=discord.ButtonStyle.danger, row=2)
+        b.callback = self._on_disconnect
+        self.add_item(b)
+
+        # ── Row 3: Back ───────────────────────────────────────────────────
+        if self.from_hub:
+            b = discord.ui.Button(label="← Back to Player",
+                                  style=discord.ButtonStyle.secondary, row=3)
+            b.callback = self._on_back
             self.add_item(b)
 
     def build_embed(self) -> discord.Embed:
@@ -1488,11 +1875,11 @@ class QueueView(discord.ui.View):
         for i, track in enumerate(page_tracks):
             abs_i = start_idx + i
             if abs_i == self.state.queue_position:
-                icon = "▶️"
+                icon = "▶"
             elif abs_i < self.state.queue_position:
-                icon = "✅"
+                icon = "✓"
             else:
-                icon = "⏸️"
+                icon = "▸"
             dur  = format_duration(track.duration) if track.duration else "?"
             name = track.get_display_name()
             if len(name) > 38:
@@ -1530,6 +1917,7 @@ class QueueView(discord.ui.View):
             await interaction.response.send_message(
                 embed=warning_embed("Join a voice channel first!"), ephemeral=True)
             return
+        await interaction.response.defer()
         target = int(interaction.data['values'][0])
         vc = self.guild.voice_client
         self.state.manual_queue_seek = True
@@ -1540,7 +1928,10 @@ class QueueView(discord.ui.View):
         await self.music_cog._play_next(self.guild, force=True, advance=False)
         self.state.manual_queue_seek = False
         self._rebuild()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        try:
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+        except discord.NotFound:
+            pass  # NP message was deleted and re-sent by _send_now_playing; nothing to update here
 
     async def _prev(self, interaction: discord.Interaction):
         self.page = max(0, self.page - 1)
@@ -1551,6 +1942,61 @@ class QueueView(discord.ui.View):
         self.page = min(self.max_page, self.page + 1)
         self._rebuild()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_clear(self, interaction: discord.Interaction):
+        if not await self._check_perms(interaction):
+            return
+        vc = self.guild.voice_client
+        if vc and vc.is_playing():
+            self.state.is_stopped = True
+            vc.stop()
+        count = len(self.state.queue)
+        for track in self.state.queue:
+            if not track.is_permanent:
+                track.cleanup()
+        self.state.reset()
+        if self.from_hub:
+            view = PlayerHubView(self.music_cog, self.guild)
+            await interaction.response.edit_message(embed=view.build_embed(), view=view, attachments=[])
+        else:
+            await interaction.response.send_message(
+                embed=success_embed("Queue Cleared", f"Removed {count} track(s)."), ephemeral=True)
+
+    async def _on_disconnect(self, interaction: discord.Interaction):
+        if not await self._check_perms(interaction):
+            return
+        vc = self.guild.voice_client
+        if not vc:
+            await interaction.response.send_message(
+                embed=warning_embed("Not connected to voice!"), ephemeral=True)
+            return
+        if vc.is_playing() or vc.is_paused():
+            self.state.is_stopped = True
+            vc.stop()
+        for track in self.state.queue:
+            if track.downloaded_path:
+                self.music_cog.tracks.mark_inactive(track.downloaded_path)
+            if track.converted_path:
+                self.music_cog.tracks.mark_inactive(track.converted_path)
+            if not track.is_permanent:
+                track.cleanup()
+        self.state.reset()
+        await asyncio.sleep(0.3)
+        await vc.disconnect()
+        if self.from_hub:
+            view = PlayerHubView(self.music_cog, self.guild)
+            await interaction.response.edit_message(embed=view.build_embed(), view=view, attachments=[])
+        else:
+            await interaction.response.send_message(
+                embed=success_embed("Disconnected", "Cleared queue and left voice channel."))
+
+    async def _on_back(self, interaction: discord.Interaction):
+        view  = PlayerHubView(self.music_cog, self.guild)
+        embed = view.build_embed()
+        track = self.state.current_track
+        if track and track.cover_url:
+            embed.set_thumbnail(url=track.cover_url)
+        await interaction.response.edit_message(embed=embed, view=view, attachments=[])
 
     async def on_timeout(self):
         self.clear_items()
@@ -1567,12 +2013,6 @@ class Music(commands.Cog):
         self.tracks = TrackManager(bot.config)
         self.voice = VoiceHandler()
         self.health = HealthMonitor(bot)
-        
-        # Start background tasks
-        bot.loop.create_task(self._cleanup_loop())
-        bot.loop.create_task(self._activity_loop())
-        bot.loop.create_task(self.health.monitor_loop())
-        
         logging.info("Music cog loaded")
     
     async def cog_load(self):
@@ -1582,11 +2022,14 @@ class Music(commands.Cog):
         orphaned = self.db.validate_files()
         if orphaned:
             logging.info(f"Startup: cleaned {orphaned} orphaned entries")
-        
-        # Update all guilds to use current storage limit from config
+
         updated = self.db.update_all_storage_limits()
         if updated:
             logging.info(f"Startup: updated storage limits for {updated} guild(s)")
+
+        asyncio.create_task(self._cleanup_loop())
+        asyncio.create_task(self._activity_loop())
+        asyncio.create_task(self.health.monitor_loop())
     
     async def cog_unload(self):
         """Cleanup on cog unload"""
@@ -1602,7 +2045,27 @@ class Music(commands.Cog):
         await self.tracks.cleanup_temp_files()
     
     # ========== Helper Methods ==========
-    
+
+    @staticmethod
+    def _make_default_cover() -> bytes:
+        """Generate a 300×300 solid-color PNG (no external deps) for tracks without artwork."""
+        w, h, r, g, b = 300, 300, 0x3e, 0x45, 0x66  # Colors.PRIMARY
+
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            c = tag + data
+            return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+
+        ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+        raw  = b''.join(b'\x00' + bytes([r, g, b] * w) for _ in range(h))
+        idat = chunk(b'IDAT', zlib.compress(raw, 9))
+        iend = chunk(b'IEND', b'')
+        return b'\x89PNG\r\n\x1a\n' + ihdr + idat + iend
+
+    def _cover_file(self, track) -> discord.File:
+        """Return a discord.File containing the track's artwork or the default cover."""
+        data = (track.get_artwork() if track else None) or self._make_default_cover()
+        return discord.File(io.BytesIO(data), filename="cover.png")
+
     async def _get_state(self, interaction: discord.Interaction):
         """Get guild state and update last channel"""
         state = await self.state.get_guild_state(interaction.guild_id)
@@ -1754,7 +2217,7 @@ class Music(commands.Cog):
             await self._send_now_playing(guild, state)
     
     async def _send_now_playing(self, guild: discord.Guild, state):
-        """Send or edit-in-place the Now Playing embed, plus a fresh track notification."""
+        """Send or edit-in-place the Now Playing embed with artwork."""
         channel = guild.get_channel(state.last_channel_id)
         if not channel:
             return
@@ -1762,38 +2225,39 @@ class Music(commands.Cog):
         if not track:
             return
 
+        view = PlayerHubView(self, guild)
+
+        # When the track changes we must resend — can't add file attachments via edit
+        if state.last_np_track is not track and state.last_np_message:
+            try:
+                await state.last_np_message.delete()
+            except Exception:
+                pass
+            state.last_np_message = None
+
         embed = self._build_now_playing_embed(guild, state)
-        view  = NowPlayingView(self, guild)
 
-        # ── 1. Track-change notification (always a new message) ───────────
-        name     = track.get_display_name()
-        pos      = state.queue_position + 1
-        total    = len(state.queue)
-        notif    = create_embed(color=Colors.PRIMARY)
-        notif.description = (
-            f"{EMOJI['play']} **Now Playing** — **{name}**\n"
-            f"Track {pos}/{total}"
-            + (f" · requested by {track.requester}" if track.requester else "")
-        )
-        try:
-            await channel.send(embed=notif)
-        except Exception as e:
-            logging.warning(f"Failed to send track notification: {e}")
-
-        # ── 2. NP embed — edit in place or create fresh ───────────────────
+        # ── Edit in place (same track) ────────────────────────────────────
         if state.last_np_message:
+            if track.cover_url:
+                embed.set_thumbnail(url=track.cover_url)
             try:
                 await state.last_np_message.edit(embed=embed, view=view)
                 return
             except discord.NotFound:
-                logging.debug("NP message deleted, will send fresh.")
                 state.last_np_message = None
             except Exception as e:
                 logging.warning(f"Failed to edit NP message: {type(e).__name__}: {e}")
                 state.last_np_message = None
 
+        # ── Fresh send with artwork ───────────────────────────────────────
+        embed.set_thumbnail(url="attachment://cover.png")
         try:
-            state.last_np_message = await channel.send(embed=embed, view=view)
+            msg = await channel.send(embed=embed, view=view, file=self._cover_file(track))
+            if msg.attachments:
+                track.cover_url = msg.attachments[0].url
+            state.last_np_message = msg
+            state.last_np_track   = track
         except Exception as e:
             logging.error(f"Failed to send now playing: {type(e).__name__}: {e}")
 
@@ -1830,26 +2294,40 @@ class Music(commands.Cog):
             details.append(f"**Speed** › {EMOJI['slow'] if speed < 100 else EMOJI['fast']} {speed}%")
         embed.add_field(name="Details", value="\n".join(details), inline=True)
 
-        # Queue
+        # Queue position + loop
         remaining  = len(state.queue) - state.queue_position - 1
         queue_info = [f"**Position** › {state.queue_position + 1}/{len(state.queue)}"]
-        if remaining > 0:
-            queue_info.append(f"**Up next** › {remaining} track(s)")
         if state.loop_enabled:
             loop_text = "∞" if state.max_loops is None else f"{state.loop_count}/{state.max_loops}"
             queue_info.append(f"**Loop** › {EMOJI['loop']} {loop_text}")
         embed.add_field(name="Queue", value="\n".join(queue_info), inline=True)
 
+        # Coming up — next 3 tracks
+        next_tracks = state.queue[state.queue_position + 1:state.queue_position + 4]
+        if next_tracks:
+            lines = [
+                f"`{state.queue_position + i + 2}.` {t.get_display_name()[:45]}"
+                for i, t in enumerate(next_tracks)
+            ]
+            if remaining > 3:
+                lines.append(f"*…+{remaining - 3} more*")
+            embed.add_field(name="Coming Up", value="\n".join(lines), inline=False)
+
         return embed
 
     async def _update_np_embed(self, guild: discord.Guild):
-        """Silently refresh the NP embed from a slash command (no interaction needed)"""
+        """Silently refresh the NP embed (volume, loop, seek) without touching the cover."""
         state = self.state.guild_states.get(guild.id)
         if not state or not state.last_np_message:
             return
+        track = state.current_track
+        if not track:
+            return
         try:
             embed = self._build_now_playing_embed(guild, state)
-            view  = NowPlayingView(self, guild)
+            view  = PlayerHubView(self, guild)
+            if track.cover_url:
+                embed.set_thumbnail(url=track.cover_url)
             await state.last_np_message.edit(embed=embed, view=view)
         except Exception as e:
             logging.debug(f"Could not refresh NP embed: {e}")
@@ -2095,9 +2573,9 @@ class Music(commands.Cog):
         if added or skipped:
             msg = []
             if added:
-                msg.append(f"✅ Added {len(added)} track(s)")
+                msg.append(f"✓ Added {len(added)} track(s)")
             if skipped:
-                msg.append(f"❌ Skipped: {', '.join(skipped[:5])}")  # Limit skipped display
+                msg.append(f"✕ Skipped: {', '.join(skipped[:5])}")
             
             size_mb = self.tracks.get_queue_size(state.queue) / (1024 * 1024)
             msg.append(f"\n{EMOJI['cd']} Queue: {size_mb:.1f}MB / {self.bot.config['max_queue_size_mb']}MB")
@@ -2120,60 +2598,7 @@ class Music(commands.Cog):
                 await self._play_next(message.guild)
     
     # ========== Admin Commands ==========
-    
-    @app_commands.command(name="blacklist", description="Add/remove user from blacklist")
-    @app_commands.choices(action=[
-        app_commands.Choice(name="Add to blacklist",      value="add"),
-        app_commands.Choice(name="Remove from blacklist", value="remove"),
-    ])
-    @admin_only()
-    @safe_defer
-    async def blacklist(self, interaction: discord.Interaction,
-                        action: app_commands.Choice[str], user: discord.Member):
-        if action.value == 'add':
-            self.db.add_blacklist(interaction.guild_id, user.id)
-            await interaction.followup.send(embed=success_embed(
-                "Blacklist Updated", f"{user.mention} has been **blacklisted**."), ephemeral=True)
-        else:
-            self.db.remove_blacklist(interaction.guild_id, user.id)
-            await interaction.followup.send(embed=success_embed(
-                "Blacklist Updated", f"{user.mention} has been **removed** from the blacklist."), ephemeral=True)
-    
-    @app_commands.command(name="role_config", description="Add/remove role from whitelist")
-    @app_commands.choices(action=[
-        app_commands.Choice(name="Add role to whitelist",      value="add"),
-        app_commands.Choice(name="Remove role from whitelist", value="remove"),
-    ])
-    @admin_only()
-    @safe_defer
-    async def role_config(self, interaction: discord.Interaction,
-                          action: app_commands.Choice[str], role: discord.Role):
-        if action.value == 'add':
-            self.db.add_role_whitelist(interaction.guild_id, role.id)
-            await interaction.followup.send(embed=success_embed(
-                "Role Whitelist Updated", f"{role.mention} **added** to whitelist."), ephemeral=True)
-        else:
-            self.db.remove_role_whitelist(interaction.guild_id, role.id)
-            await interaction.followup.send(embed=success_embed(
-                "Role Whitelist Updated", f"{role.mention} **removed** from whitelist."), ephemeral=True)
-    
-    @app_commands.command(name="autodisconnect", description="Toggle auto-disconnect when queue empty")
-    @admin_only()
-    @safe_defer
-    async def autodisconnect(self, interaction: discord.Interaction, enabled: bool):
-        self.db.set_autodisconnect(interaction.guild_id, enabled)
-        status = "enabled" if enabled else "disabled"
-        await interaction.followup.send(embed=success_embed("Auto-Disconnect", f"Auto-disconnect {status}"))
-    
-    @app_commands.command(name="autoplay", description="Toggle autoplay")
-    @admin_only()
-    @safe_defer
-    async def autoplay(self, interaction: discord.Interaction, enabled: bool):
-        self.db.set_autoplay(interaction.guild_id, enabled)
-        self.state.alone_since.pop(interaction.guild_id, None)
-        status = "enabled" if enabled else "disabled"
-        await interaction.followup.send(embed=success_embed("Autoplay", f"Autoplay {status}"))
-    
+
     @app_commands.command(name="health", description="Check bot health")
     @admin_only()
     @safe_defer
@@ -2182,10 +2607,10 @@ class Music(commands.Cog):
         orphaned = self.db.validate_files()
         
         embed = create_embed(color=Colors.PRIMARY)
-        embed.title = "🏥 Bot Health"
+        embed.title = "Bot Health"
         
         # Status indicator
-        status = "🟢 Healthy" if stats['recent_failures'] < 5 else "🟡 Degraded" if stats['recent_failures'] < 10 else "🔴 Issues"
+        status = "Healthy" if stats['recent_failures'] < 5 else "Degraded" if stats['recent_failures'] < 10 else "Issues"
         embed.description = f"**Status** › {status}"
         
         # Stats
@@ -2214,23 +2639,20 @@ class Music(commands.Cog):
         await interaction.followup.send(embed=embed, view=view)
     
     # ========== Playback Commands ==========
-    
-    @app_commands.command(name="play", description="Play from queue or library")
-    @app_commands.describe(name="Optional: library sound name to queue and play")
+
+    @app_commands.command(name="play", description="Open the player, or queue a library track by name")
+    @app_commands.describe(name="Library track to queue (leave empty to open the player hub)")
     @check_permissions()
     @safe_defer
     async def play(self, interaction: discord.Interaction, name: str = None):
         state = await self._get_state(interaction)
 
-        if not interaction.user.voice:
-            await interaction.followup.send(embed=warning_embed("Join a voice channel first!"), ephemeral=True)
-            return
-
-        # Queue a library track if name given
+        # Queue a named library track
         if name:
             track_data = self.db.get_track(interaction.guild_id, name)
             if not track_data:
-                await interaction.followup.send(embed=error_embed(f"Sound **{name}** not found in library."), ephemeral=True)
+                await interaction.followup.send(
+                    embed=error_embed(f"Sound **{name}** not found in library."), ephemeral=True)
                 return
             track = AudioTrack(
                 url=track_data['file_path'],
@@ -2242,168 +2664,50 @@ class Music(commands.Cog):
             track.downloaded_path = track_data['file_path']
             track.duration = track.get_metadata(track_data['file_path'])
             state.queue.append(track)
-            await interaction.followup.send(
-                embed=success_embed("Queued", f"{EMOJI['music']} **{name}** added to queue."),
-                ephemeral=True
-            )
 
-        # Connect if needed
-        if not interaction.guild.voice_client:
+        # Connect to VC if user is in one
+        if interaction.user.voice and not interaction.guild.voice_client:
             vc = await self.voice.connect(interaction.user.voice.channel)
             if not vc:
-                await interaction.followup.send(embed=error_embed("Failed to connect to voice channel."), ephemeral=True)
+                await interaction.followup.send(
+                    embed=error_embed("Failed to connect to voice channel."), ephemeral=True)
                 return
 
-        # Start or resume playback
         vc = interaction.guild.voice_client
-        if vc.is_paused():
+
+        # Resume if paused and no specific track was queued
+        if vc and vc.is_paused() and not name:
             if state.current_track:
                 state.current_track.resume_playback()
             vc.resume()
-            await self._update_np_embed(interaction.guild)
-            if not name:
-                await interaction.followup.send(embed=success_embed("Resumed", "Playback resumed!"), ephemeral=True)
-        elif not vc.is_playing():
-            if state.queue:
-                if state.queue_position < 0:
-                    state.queue_position = 0
-                state.is_stopped = False
-                await self._play_next(interaction.guild, force=True, advance=False)
-                if not name:
-                    await interaction.followup.send(embed=success_embed("Starting", "Starting playback…"), ephemeral=True)
-            else:
-                await interaction.followup.send(embed=warning_embed("Queue is empty! Upload some files first."), ephemeral=True)
-        elif not name:
-            await interaction.followup.send(embed=warning_embed("Already playing! Use `/skip`, `/stop`, or the player buttons."), ephemeral=True)
-    
-    @app_commands.command(name="pause", description="Pause playback")
-    @check_permissions()
-    @safe_defer
-    async def pause(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        if not vc or not vc.is_playing():
-            await interaction.followup.send(embed=warning_embed("Nothing is playing!"), ephemeral=True)
-            return
 
-        state = await self._get_state(interaction)
-        if state.current_track:
-            state.current_track.pause_playback()
-        vc.pause()
+        # Start playback if connected and queue has something
+        start_playback = (vc and not vc.is_playing() and not vc.is_paused() and state.queue)
+        if start_playback:
+            if state.queue_position < 0:
+                state.queue_position = 0
+            state.is_stopped = False
 
-        await self._update_np_embed(interaction.guild)
-        await interaction.followup.send(
-            embed=success_embed("Paused", "Use `/resume`, or press ▶️ on the player to continue."),
-            ephemeral=True
-        )
-    
-    @app_commands.command(name="resume", description="Resume playback")
-    @check_permissions()
-    @safe_defer
-    async def resume(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        state = await self._get_state(interaction)
-
-        # Allow resume from stopped state if queue has tracks
-        if vc and vc.is_paused():
-            if state.current_track:
-                state.current_track.resume_playback()
-            vc.resume()
-            await self._update_np_embed(interaction.guild)
-            await interaction.followup.send(embed=success_embed("Resumed", "Playback resumed!"), ephemeral=True)
-        elif not vc or (not vc.is_playing() and not vc.is_paused()):
-            # Restart from stopped
-            if state.queue and state.queue_position >= 0:
-                state.is_stopped = False
-                await self._play_next(interaction.guild, force=True, advance=False)
-                await interaction.followup.send(embed=success_embed("Resumed", "Restarting playback!"), ephemeral=True)
-            else:
-                await interaction.followup.send(embed=warning_embed("Nothing to resume!"), ephemeral=True)
+        # Send PlayerHub with artwork, then start playback so it edits in place
+        hub   = PlayerHubView(self, interaction.guild)
+        embed = hub.build_embed()
+        track = state.current_track
+        if track and track.cover_url:
+            embed.set_thumbnail(url=track.cover_url)
+            msg = await interaction.followup.send(embed=embed, view=hub)
         else:
-            await interaction.followup.send(embed=warning_embed("Already playing!"), ephemeral=True)
-    
-    @app_commands.command(name="stop", description="Stop playback (keeps queue)")
-    @check_permissions()
-    @safe_defer
-    async def stop(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        if not vc or (not vc.is_playing() and not vc.is_paused()):
-            await interaction.followup.send(embed=warning_embed("Nothing is playing!"), ephemeral=True)
-            return
+            embed.set_thumbnail(url="attachment://cover.png")
+            msg = await interaction.followup.send(embed=embed, view=hub,
+                                                   file=self._cover_file(track))
+            if msg.attachments and track:
+                track.cover_url     = msg.attachments[0].url
+                state.last_np_track = track
 
-        state = await self._get_state(interaction)
-        if state.current_track:
-            self.tracks.mark_inactive(state.current_track.downloaded_path)
-            if state.current_track.converted_path:
-                self.tracks.mark_inactive(state.current_track.converted_path)
-        state.is_stopped = True
-        vc.stop()
+        state.last_np_message = msg
 
-        await self._update_np_embed(interaction.guild)
-        await interaction.followup.send(
-            embed=success_embed("Stopped", "Queue is intact — use `/resume` or `/play` to continue."),
-            ephemeral=True
-        )
-    
-    @app_commands.command(name="skip", description="Skip to next track")
-    @check_permissions()
-    @safe_defer
-    async def skip(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        if not vc or (not vc.is_playing() and not vc.is_paused()):
-            await interaction.followup.send(embed=warning_embed("Nothing is playing!"), ephemeral=True)
-            return
+        if start_playback:
+            await self._play_next(interaction.guild, force=True, advance=False)
 
-        state = await self._get_state(interaction)
-        if state.queue_position >= len(state.queue) - 1:
-            await interaction.followup.send(embed=warning_embed("Already at the last track!"), ephemeral=True)
-            return
-
-        state.loop_enabled      = False
-        state.loop_count        = 0
-        state.max_loops         = None
-        state.manual_queue_seek = True
-        state.queue_position   += 1
-
-        vc.stop()
-        await asyncio.sleep(0.3)
-        await self._play_next(interaction.guild, force=True, advance=False)
-        state.manual_queue_seek = False
-
-        await interaction.followup.send(
-            embed=success_embed("Skipped", f"{EMOJI['skip']} Playing next track..."),
-            ephemeral=True
-        )
-
-    @app_commands.command(name="previous", description="Go back to previous track")
-    @check_permissions()
-    @safe_defer
-    async def previous(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        if not vc or (not vc.is_playing() and not vc.is_paused()):
-            await interaction.followup.send(embed=warning_embed("Nothing is playing!"), ephemeral=True)
-            return
-
-        state = await self._get_state(interaction)
-        if state.queue_position <= 0:
-            await interaction.followup.send(embed=warning_embed("Already at the first track!"), ephemeral=True)
-            return
-
-        state.loop_enabled      = False
-        state.loop_count        = 0
-        state.max_loops         = None
-        state.manual_queue_seek = True
-        state.queue_position   -= 1
-
-        vc.stop()
-        await asyncio.sleep(0.3)
-        await self._play_next(interaction.guild, force=True, advance=False)
-        state.manual_queue_seek = False
-
-        await interaction.followup.send(
-            embed=success_embed("Going Back", f"{EMOJI['play']} Playing previous track..."),
-            ephemeral=True
-        )
-    
     @app_commands.command(name="volume", description="Set volume (0-120)")
     @check_permissions()
     @safe_defer
@@ -2424,12 +2728,12 @@ class Music(commands.Cog):
     
     @app_commands.command(name="speed", description="Set playback speed")
     @app_commands.choices(speed=[
-        app_commands.Choice(name="🐌 0.5× Slow",   value=50),
-        app_commands.Choice(name="🐢 0.75×",        value=75),
-        app_commands.Choice(name="⏱️ 1× Normal",    value=100),
-        app_commands.Choice(name="⚡ 1.25×",        value=125),
-        app_commands.Choice(name="⚡ 1.5× Fast",    value=150),
-        app_commands.Choice(name="🚀 2× Very Fast", value=200),
+        app_commands.Choice(name="0.5×  Slow",     value=50),
+        app_commands.Choice(name="0.75×",           value=75),
+        app_commands.Choice(name="1×  Normal",      value=100),
+        app_commands.Choice(name="1.25×",           value=125),
+        app_commands.Choice(name="1.5×  Fast",      value=150),
+        app_commands.Choice(name="2×  Very Fast",   value=200),
     ])
     @check_permissions()
     @safe_defer
@@ -2441,53 +2745,41 @@ class Music(commands.Cog):
             f"{speed.name} — applies to next track."
         ), ephemeral=True)
     
-    @app_commands.command(name="loop", description="Set loop mode for current track")
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="🔄 Infinite loop", value=0),
-        app_commands.Choice(name="1× then stop",     value=1),
-        app_commands.Choice(name="2×",               value=2),
-        app_commands.Choice(name="3×",               value=3),
-        app_commands.Choice(name="5×",               value=5),
-        app_commands.Choice(name="10×",              value=10),
-        app_commands.Choice(name="❌ Disable loop",   value=-1),
-    ])
+    @app_commands.command(name="loop", description="Toggle infinite loop, or pass a number to loop that many times")
+    @app_commands.describe(times="Number of times to loop (0 = disable, omit = toggle infinite)")
     @check_permissions()
     @safe_defer
-    async def loop(self, interaction: discord.Interaction, mode: app_commands.Choice[int] = None):
+    async def loop(self, interaction: discord.Interaction, times: int = None):
         state = await self._get_state(interaction)
 
         if not state.current_track:
             await interaction.followup.send(embed=warning_embed("Nothing is playing!"), ephemeral=True)
             return
 
-        # No argument = toggle
-        if mode is None:
+        if times is None:
+            # Toggle: disable any active loop, or enable infinite if off
             if state.loop_enabled:
                 state.loop_enabled = False
                 state.loop_count   = 0
                 state.max_loops    = None
-                await interaction.followup.send(embed=success_embed("Loop Disabled", "Loop off."), ephemeral=True)
+                msg = "Loop off."
             else:
                 state.loop_enabled = True
                 state.loop_count   = 0
                 state.max_loops    = None
-                await interaction.followup.send(embed=success_embed(
-                    "Loop Enabled", f"{EMOJI['loop']} Looping current track (infinite)"), ephemeral=True)
-            await self._update_np_embed(interaction.guild)
-            return
-
-        if mode.value == -1:
+                msg = f"{EMOJI['loop']} Looping infinitely."
+            await interaction.followup.send(embed=success_embed("Loop", msg), ephemeral=True)
+        elif times <= 0:
             state.loop_enabled = False
             state.loop_count   = 0
             state.max_loops    = None
-            await interaction.followup.send(embed=success_embed("Loop Disabled", "Loop off."), ephemeral=True)
+            await interaction.followup.send(embed=success_embed("Loop", "Loop off."), ephemeral=True)
         else:
             state.loop_enabled = True
             state.loop_count   = 0
-            state.max_loops    = None if mode.value == 0 else mode.value
-            loop_text = "infinite" if mode.value == 0 else f"{mode.value}×"
+            state.max_loops    = times
             await interaction.followup.send(embed=success_embed(
-                "Loop Set", f"{EMOJI['loop']} Looping current track ({loop_text})"), ephemeral=True)
+                "Loop", f"{EMOJI['loop']} Looping **{times}×**."), ephemeral=True)
 
         await self._update_np_embed(interaction.guild)
     
@@ -2593,179 +2885,6 @@ class Music(commands.Cog):
         await interaction.followup.send(embed=success_embed(
             "Position Set",
             f"Jumped to {format_duration(target)}"
-        ))
-    
-    # ========== Queue Commands ==========
-    
-    @app_commands.command(name="queue", description="Show and navigate the queue")
-    @check_permissions()
-    @safe_defer
-    async def queue(self, interaction: discord.Interaction):
-        state = await self._get_state(interaction)
-
-        if not state.queue:
-            await interaction.followup.send(embed=warning_embed("Queue is empty!"), ephemeral=True)
-            return
-
-        # Start on the page containing the current track
-        cur_page = max(0, state.queue_position // QueueView.TRACKS_PER_PAGE)
-        view  = QueueView(state, self, interaction.guild, page=cur_page)
-        embed = view.build_embed()
-        await interaction.followup.send(embed=embed, view=view)
-    
-    @app_commands.command(name="seekqueue", description="Jump to queue position")
-    @app_commands.describe(position="Queue position (1 = first)")
-    @check_permissions()
-    @safe_defer
-    async def seekqueue(self, interaction: discord.Interaction, position: int):
-        if not interaction.user.voice:
-            await interaction.followup.send(embed=warning_embed("Join a voice channel first!"), ephemeral=True)
-            return
-
-        state = await self._get_state(interaction)
-
-        if not state.queue:
-            await interaction.followup.send(embed=warning_embed("Queue is empty!"), ephemeral=True)
-            return
-
-        if not 1 <= position <= len(state.queue):
-            await interaction.followup.send(embed=warning_embed(
-                f"Position must be 1–{len(state.queue)}"), ephemeral=True)
-            return
-
-        state.manual_queue_seek = True
-        state.queue_position = position - 1
-
-        vc = interaction.guild.voice_client
-        if not vc:
-            vc = await self.voice.connect(interaction.user.voice.channel)
-            if not vc:
-                await interaction.followup.send(embed=error_embed("Failed to connect to voice channel."), ephemeral=True)
-                state.manual_queue_seek = False
-                return
-        elif vc.is_playing():
-            vc.stop()
-
-        await asyncio.sleep(0.5)
-        await self._play_next(interaction.guild, force=True, advance=False)
-        state.manual_queue_seek = False
-
-        track = state.current_track
-        name  = track.get_display_name() if track else f"#{position}"
-        await interaction.followup.send(embed=success_embed(
-            f"Jumped to #{position}",
-            f"{EMOJI['music']} **{name}**"
-        ), ephemeral=True)
-    
-    @app_commands.command(name="playing", description="Show current track")
-    @check_permissions()
-    @safe_defer
-    async def playing(self, interaction: discord.Interaction):
-        state = await self._get_state(interaction)
-        track = state.current_track
-
-        if not track:
-            await interaction.followup.send(embed=warning_embed("Nothing is playing!"), ephemeral=True)
-            return
-
-        embed = self._build_now_playing_embed(interaction.guild, state)
-        view  = NowPlayingView(self, interaction.guild)
-
-        # Promote this as the new NP message
-        msg = await interaction.followup.send(embed=embed, view=view)
-        state.last_np_message = msg
-    
-    @app_commands.command(name="clear", description="Clear queue and stop")
-    @check_permissions()
-    @safe_defer
-    async def clear(self, interaction: discord.Interaction):
-        state = await self._get_state(interaction)
-        
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            state.is_stopped = True
-            vc.stop()
-        
-        count = len(state.queue)
-        for track in state.queue:
-            if not track.is_permanent:
-                track.cleanup()
-        
-        state.reset()
-        
-        await interaction.followup.send(embed=success_embed(
-            "Queue Cleared",
-            f"Removed {count} track(s) from queue"
-        ))
-    
-    @app_commands.command(name="remove", description="Remove track from queue")
-    @check_permissions()
-    @safe_defer
-    async def remove(self, interaction: discord.Interaction, position: int):
-        state = await self._get_state(interaction)
-        
-        if not state.queue:
-            await interaction.followup.send(embed=warning_embed("Queue is empty!"))
-            return
-        
-        if not 1 <= position <= len(state.queue):
-            await interaction.followup.send(embed=warning_embed(
-                f"Position must be 1-{len(state.queue)}"
-            ))
-            return
-        
-        if position - 1 == state.queue_position:
-            await interaction.followup.send(embed=warning_embed(
-                "Can't remove currently playing track! Use /skip instead."
-            ))
-            return
-        
-        track = state.queue.pop(position - 1)
-        track.cleanup()
-        
-        # Adjust queue position if needed
-        if position - 1 < state.queue_position:
-            state.queue_position -= 1
-        
-        await interaction.followup.send(embed=success_embed(
-            "Track Removed",
-            f"Removed: **{track.get_display_name()}**"
-        ))
-    
-    @app_commands.command(name="disconnect", description="Disconnect from voice")
-    @check_permissions()
-    @safe_defer
-    async def disconnect(self, interaction: discord.Interaction):
-        state = await self._get_state(interaction)
-        vc = interaction.guild.voice_client
-        
-        if not vc:
-            await interaction.followup.send(embed=warning_embed("Not connected to voice!"))
-            return
-        
-        if vc.is_playing():
-            state.is_stopped = True
-            vc.stop()
-        
-        await asyncio.sleep(0.5)
-        
-        # Cleanup
-        for track in state.queue:
-            if track.downloaded_path:
-                self.tracks.mark_inactive(track.downloaded_path)
-            if track.converted_path:
-                self.tracks.mark_inactive(track.converted_path)
-            if not track.is_permanent:
-                track.cleanup()
-        
-        queue_len = len(state.queue)
-        state.reset()
-        
-        await vc.disconnect()
-        
-        await interaction.followup.send(embed=success_embed(
-            "Disconnected",
-            f"Cleared {queue_len} track(s) from queue"
         ))
     
     # ========== Library Commands ==========
@@ -2936,302 +3055,115 @@ class Music(commands.Cog):
                 await interaction.followup.send(embed=error_embed(f"Download failed: {str(e)[:100]}"))
                 logging.error(f"Failed to download URL to library: {e}")
     
-    @app_commands.command(name="save", description="Save a CDN link or URL to library")
-    @app_commands.describe(name="Name for the sound", url="CDN link or direct audio URL")
+    # ========== Queue / Hub Shortcut Commands ==========
+
+    @app_commands.command(name="playing", description="Open the player hub")
     @check_permissions()
     @safe_defer
-    async def save(self, interaction: discord.Interaction, name: str, url: str):
-        # Validate URL format
-        if not url.startswith('http://') and not url.startswith('https://'):
-            await interaction.followup.send(embed=error_embed("Invalid URL! Must start with http:// or https://"))
-            return
-        
-        # Check if name exists
-        if self.db.get_track(interaction.guild_id, name):
-            await interaction.followup.send(embed=warning_embed(f"'{name}' already exists in library!"))
-            return
-        
-        # Extract filename and validate extension
-        ALLOWED_EXTS = {'.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.mp4', '.webm'}
-        filename = url.split('/')[-1].split('?')[0]
-        
-        # Try to detect extension
-        ext = os.path.splitext(filename)[1].lower()
-        if not ext:
-            for allowed_ext in ALLOWED_EXTS:
-                if allowed_ext in url.lower():
-                    ext = allowed_ext
-                    filename = f"{name}{ext}"
-                    break
-            else:
-                ext = '.mp3'  # Default
-                filename = f"{name}.mp3"
-        
-        if ext not in ALLOWED_EXTS:
-            await interaction.followup.send(embed=error_embed(
-                f"Unsupported format! Supported: {', '.join(ALLOWED_EXTS)}"
-            ))
-            return
-        
-        # Try to get file size
-        file_size = 0
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.head(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        await interaction.followup.send(embed=error_embed(f"Failed to access URL (Status {resp.status})"))
-                        return
-                    file_size = int(resp.headers.get('content-length', 0))
-                    if file_size == 0:
-                        file_size = 5 * 1024 * 1024  # 5MB estimate
-        except Exception as e:
-            logging.error(f"Failed to get file size for {url}: {e}")
-            file_size = 5 * 1024 * 1024  # 5MB estimate
-        
-        # Check storage
-        if not self.db.can_store(interaction.guild_id, file_size):
-            storage = self.db.get_storage(interaction.guild_id)
-            await interaction.followup.send(embed=error_embed(
-                f"Storage full! {storage['used'] / 1024 / 1024:.1f}MB / {storage['max'] / 1024 / 1024:.1f}MB"
-            ))
-            return
-        
-        # Download the file
-        perm_folder = 'permanent'
-        os.makedirs(perm_folder, exist_ok=True)
-        
-        safe_name = ''.join(c for c in filename if c.isalnum() or c in '._- ')
-        file_path = os.path.join(perm_folder, f"{interaction.guild_id}_{safe_name}")
-        
-        try:
-            await interaction.followup.send(embed=info_embed(
-                "Downloading...",
-                f"{EMOJI['loading']} Downloading audio file to library..."
-            ))
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    if resp.status != 200:
-                        await interaction.followup.send(embed=error_embed(f"Download failed (Status {resp.status})"))
-                        return
-                    
-                    with open(file_path, 'wb') as f:
-                        async for chunk in resp.content.iter_chunked(8192):
-                            f.write(chunk)
-            
-            # Get actual file size
-            actual_size = os.path.getsize(file_path)
-            
-            # Add to database
-            self.db.add_track(
-                interaction.guild_id, name, filename, file_path,
-                interaction.user.display_name, actual_size
-            )
-            
-            await interaction.followup.send(embed=success_embed(
-                "Saved to Library",
-                f"{EMOJI['music']} **{name}** saved to library ({actual_size / 1024 / 1024:.1f}MB)\n"
-                f"Use `/play {name}` to play"
-            ))
-            
-            logging.info(f"Saved CDN link to library: {name} ({url})")
-            
-        except asyncio.TimeoutError:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            await interaction.followup.send(embed=error_embed("Download timed out! Try a smaller file."))
-        except Exception as e:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            logging.error(f"Failed to save CDN link: {e}")
-            await interaction.followup.send(embed=error_embed(f"Failed to save: {str(e)[:100]}"))
-    
-    @app_commands.command(name="library", description="Browse and queue library sounds")
+    async def playing(self, interaction: discord.Interaction):
+        state = await self._get_state(interaction)
+        hub   = PlayerHubView(self, interaction.guild)
+        embed = hub.build_embed()
+        track = state.current_track
+        if track and track.cover_url:
+            embed.set_thumbnail(url=track.cover_url)
+            msg = await interaction.followup.send(embed=embed, view=hub)
+        else:
+            embed.set_thumbnail(url="attachment://cover.png")
+            msg = await interaction.followup.send(embed=embed, view=hub,
+                                                   file=self._cover_file(track))
+            if msg.attachments and track:
+                track.cover_url     = msg.attachments[0].url
+                state.last_np_track = track
+        state.last_np_message = msg
+
+    @app_commands.command(name="library", description="Open the library browser")
     @check_permissions()
     @safe_defer
     async def library(self, interaction: discord.Interaction):
-        tracks = self.db.list_tracks(interaction.guild_id)
-        
-        if not tracks:
-            await interaction.followup.send(embed=warning_embed(
-                "Library is empty! Use /upload to add sounds."
-            ))
-            return
-        
-        view = LibraryView(tracks, interaction.guild_id, self)
-        embed = view._build_embed()
-        await interaction.followup.send(embed=embed, view=view)
-    
-    @app_commands.command(name="remove_sound", description="Remove from library")
-    @admin_only()
-    @safe_defer
-    async def remove_sound(self, interaction: discord.Interaction, name: str):
-        file_path = self.db.remove_track(interaction.guild_id, name)
-        
-        if not file_path:
-            await interaction.followup.send(embed=error_embed(f"'{name}' not found in library"))
-            return
-        
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        
-        await interaction.followup.send(embed=success_embed(
-            "Removed from Library",
-            f"**{name}** has been removed"
-        ))
-    
-    # ========== Playlist Commands ==========
-
-    playlist_group = app_commands.Group(name="playlist", description="Manage playlists from the library")
-
-    @playlist_group.command(name="list", description="Browse and manage playlists")
-    @check_permissions()
-    @safe_defer
-    async def playlist_list(self, interaction: discord.Interaction):
-        view  = PlaylistManagerView(self, interaction.guild, interaction.user)
-        embed = view.build_embed()
-        await interaction.followup.send(embed=embed, view=view)
-
-    @playlist_group.command(name="view", description="View a specific playlist's tracks")
-    @app_commands.describe(name="Playlist name")
-    @check_permissions()
-    @safe_defer
-    async def playlist_view(self, interaction: discord.Interaction, name: str):
-        playlist = self.db.get_playlist(interaction.guild_id, name)
-        if not playlist:
-            await interaction.followup.send(embed=error_embed(f"Playlist **{name}** not found."), ephemeral=True)
-            return
-        tracks = self.db.get_playlist_tracks(interaction.guild_id, name)
-        view   = PlaylistDetailView(name, playlist, tracks, self, interaction.guild, interaction.user)
-        await interaction.followup.send(embed=view.build_embed(), view=view)
-
-    @playlist_group.command(name="play", description="Queue all tracks from a playlist")
-    @app_commands.describe(name="Playlist name")
-    @check_permissions()
-    @safe_defer
-    async def playlist_play(self, interaction: discord.Interaction, name: str):
-        if not interaction.user.voice:
-            await interaction.followup.send(embed=warning_embed("Join a voice channel first!"), ephemeral=True)
-            return
-
-        added = await self._queue_playlist_tracks(
-            name, interaction.guild, interaction.user, interaction.channel_id)
-
-        if not added:
-            await interaction.followup.send(
-                embed=error_embed(f"Playlist **{name}** is empty or doesn't exist."), ephemeral=True)
-            return
-
-        if not interaction.guild.voice_client:
-            vc = await self.voice.connect(interaction.user.voice.channel)
-            if not vc:
-                await interaction.followup.send(embed=error_embed("Failed to connect to voice channel."), ephemeral=True)
-                return
-
         state = await self._get_state(interaction)
-        if not interaction.guild.voice_client.is_playing():
-            if state.queue_position < 0:
-                state.queue_position = 0
-            await self._play_next(interaction.guild, force=True, advance=False)
+        tracks = self.db.list_tracks(interaction.guild_id)
+        view   = LibraryView(tracks, interaction.guild_id, self, from_hub=True)
+        msg    = await interaction.followup.send(embed=view.build_embed(), view=view)
+        state.last_np_message = msg
 
+    @app_commands.command(name="playlist", description="Open the playlist manager")
+    @check_permissions()
+    @safe_defer
+    async def playlist(self, interaction: discord.Interaction):
+        state = await self._get_state(interaction)
+        view  = PlaylistManagerView(self, interaction.guild, interaction.user, from_hub=True)
+        msg   = await interaction.followup.send(embed=view.build_embed(), view=view)
+        state.last_np_message = msg
+
+    @app_commands.command(name="clear", description="Clear queue and stop")
+    @check_permissions()
+    @safe_defer
+    async def clear(self, interaction: discord.Interaction):
+        state = await self._get_state(interaction)
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            state.is_stopped = True
+            vc.stop()
+        count = len(state.queue)
+        for track in state.queue:
+            if not track.is_permanent:
+                track.cleanup()
+        state.reset()
         await interaction.followup.send(embed=success_embed(
-            "Playlist Queued",
-            f"{EMOJI['queue']} **{name}** — {added} track(s) added to queue."
-        ), ephemeral=True)
+            "Queue Cleared", f"Removed {count} track(s) from queue"))
 
-    @playlist_group.command(name="create", description="Create a new playlist")
-    @app_commands.describe(name="Playlist name", description="Optional description")
-    @admin_only()
+    @app_commands.command(name="remove", description="Remove a track from the queue by position")
+    @app_commands.describe(position="Queue position (1 = first)")
+    @check_permissions()
     @safe_defer
-    async def playlist_create(self, interaction: discord.Interaction, name: str, description: str = ''):
-        if len(name) > 50:
-            await interaction.followup.send(embed=warning_embed("Playlist name must be 50 characters or fewer."), ephemeral=True)
+    async def remove(self, interaction: discord.Interaction, position: int):
+        state = await self._get_state(interaction)
+        if not state.queue:
+            await interaction.followup.send(embed=warning_embed("Queue is empty!"), ephemeral=True)
             return
-        if self.db.create_playlist(interaction.guild_id, name, interaction.user.display_name, description):
-            await interaction.followup.send(embed=success_embed(
-                "Playlist Created",
-                f"{EMOJI['queue']} **{name}** created.\nUse `/playlist list` to manage it."
-            ), ephemeral=True)
-        else:
-            await interaction.followup.send(embed=warning_embed(f"Playlist **{name}** already exists!"), ephemeral=True)
+        if not 1 <= position <= len(state.queue):
+            await interaction.followup.send(embed=warning_embed(
+                f"Position must be 1–{len(state.queue)}"), ephemeral=True)
+            return
+        if position - 1 == state.queue_position:
+            await interaction.followup.send(embed=warning_embed(
+                "Can't remove the currently playing track."), ephemeral=True)
+            return
+        track = state.queue.pop(position - 1)
+        if position - 1 < state.queue_position:
+            state.queue_position -= 1
+        track.cleanup()
+        await interaction.followup.send(embed=success_embed(
+            "Track Removed", f"Removed: **{track.get_display_name()}**"))
 
-    @playlist_group.command(name="delete", description="Delete a playlist")
-    @app_commands.describe(name="Playlist name")
-    @admin_only()
+    @app_commands.command(name="disconnect", description="Disconnect from voice and clear queue")
+    @check_permissions()
     @safe_defer
-    async def playlist_delete(self, interaction: discord.Interaction, name: str):
-        if self.db.delete_playlist(interaction.guild_id, name):
-            await interaction.followup.send(embed=success_embed(
-                "Playlist Deleted", f"**{name}** has been deleted."), ephemeral=True)
-        else:
-            await interaction.followup.send(embed=error_embed(f"Playlist **{name}** not found."), ephemeral=True)
-
-    @playlist_group.command(name="add", description="Add a track to a playlist")
-    @app_commands.describe(name="Playlist name", track="Track name from library")
-    @admin_only()
-    @safe_defer
-    async def playlist_add(self, interaction: discord.Interaction, name: str, track: str = None):
-        playlist = self.db.get_playlist(interaction.guild_id, name)
-        if not playlist:
-            await interaction.followup.send(embed=error_embed(f"Playlist **{name}** not found."), ephemeral=True)
+    async def disconnect(self, interaction: discord.Interaction):
+        state = await self._get_state(interaction)
+        vc = interaction.guild.voice_client
+        if not vc:
+            await interaction.followup.send(embed=warning_embed("Not connected to voice!"), ephemeral=True)
             return
-
-        # Direct add if track specified
-        if track:
-            err = self.db.add_to_playlist(interaction.guild_id, name, track, interaction.user.display_name)
-            if err:
-                await interaction.followup.send(embed=error_embed(err), ephemeral=True)
-            else:
-                await interaction.followup.send(embed=success_embed(
-                    "Track Added", f"**{track}** added to **{name}**."), ephemeral=True)
-            return
-
-        # Otherwise open interactive add view
-        library  = self.db.list_tracks(interaction.guild_id)
-        existing = {t['track_name'] for t in self.db.get_playlist_tracks(interaction.guild_id, name)}
-        available = [t for t in library if t['track_name'] not in existing]
-
-        if not library:
-            await interaction.followup.send(embed=warning_embed("Library is empty! Upload sounds first."), ephemeral=True)
-            return
-        if not available:
-            await interaction.followup.send(embed=info_embed(
-                "All Tracks Added", f"Every library track is already in **{name}**."), ephemeral=True)
-            return
-
-        view = PlaylistAddView(available, name, self, interaction.guild, interaction.user)
-        await interaction.followup.send(embed=view.build_embed(), view=view)
-
-    @playlist_group.command(name="remove", description="Remove a track from a playlist")
-    @app_commands.describe(name="Playlist name", track="Track name to remove")
-    @admin_only()
-    @safe_defer
-    async def playlist_remove(self, interaction: discord.Interaction, name: str, track: str):
-        if self.db.remove_from_playlist(interaction.guild_id, name, track):
-            await interaction.followup.send(embed=success_embed(
-                "Track Removed", f"**{track}** removed from **{name}**."), ephemeral=True)
-        else:
-            await interaction.followup.send(embed=error_embed(
-                f"**{track}** not found in playlist **{name}**."), ephemeral=True)
+        if vc.is_playing():
+            state.is_stopped = True
+            vc.stop()
+        await asyncio.sleep(0.3)
+        for track in state.queue:
+            if track.downloaded_path:
+                self.tracks.mark_inactive(track.downloaded_path)
+            if track.converted_path:
+                self.tracks.mark_inactive(track.converted_path)
+            if not track.is_permanent:
+                track.cleanup()
+        count = len(state.queue)
+        state.reset()
+        await vc.disconnect()
+        await interaction.followup.send(embed=success_embed(
+            "Disconnected", f"Left voice and cleared {count} track(s)."))
 
     # ---- Autocomplete ----
-
-    async def _playlist_autocomplete(self, interaction: discord.Interaction, current: str):
-        playlists = self.db.list_playlists(interaction.guild_id)
-        return [
-            app_commands.Choice(name=p['playlist_name'], value=p['playlist_name'])
-            for p in playlists if current.lower() in p['playlist_name'].lower()
-        ][:25]
-
-    async def _playlist_track_autocomplete(self, interaction: discord.Interaction, current: str):
-        playlist_name = getattr(interaction.namespace, 'name', None)
-        if not playlist_name:
-            return []
-        tracks = self.db.get_playlist_tracks(interaction.guild_id, playlist_name)
-        return [
-            app_commands.Choice(name=t['track_name'], value=t['track_name'])
-            for t in tracks if current.lower() in t['track_name'].lower()
-        ][:25]
 
     async def _library_track_autocomplete(self, interaction: discord.Interaction, current: str):
         tracks = self.db.list_tracks(interaction.guild_id)
@@ -3244,34 +3176,6 @@ class Music(commands.Cog):
     async def _play_name(self, interaction: discord.Interaction, current: str):
         return await self._library_track_autocomplete(interaction, current)
 
-    @playlist_view.autocomplete('name')
-    async def _pv_name(self, interaction, current):
-        return await self._playlist_autocomplete(interaction, current)
-
-    @playlist_play.autocomplete('name')
-    async def _pp_name(self, interaction, current):
-        return await self._playlist_autocomplete(interaction, current)
-
-    @playlist_delete.autocomplete('name')
-    async def _pd_name(self, interaction, current):
-        return await self._playlist_autocomplete(interaction, current)
-
-    @playlist_add.autocomplete('name')
-    async def _pa_name(self, interaction, current):
-        return await self._playlist_autocomplete(interaction, current)
-
-    @playlist_add.autocomplete('track')
-    async def _pa_track(self, interaction, current):
-        return await self._library_track_autocomplete(interaction, current)
-
-    @playlist_remove.autocomplete('name')
-    async def _pr_name(self, interaction, current):
-        return await self._playlist_autocomplete(interaction, current)
-
-    @playlist_remove.autocomplete('track')
-    async def _pr_track(self, interaction, current):
-        return await self._playlist_track_autocomplete(interaction, current)
-    
     # ========== Radio Commands ==========
     
     
@@ -3280,77 +3184,73 @@ class Music(commands.Cog):
     @app_commands.command(name="help", description="Show all commands")
     async def help(self, interaction: discord.Interaction):
         embed = create_embed(color=Colors.PRIMARY)
-        embed.title = f"{EMOJI['music']} SporkMP3 Commands"
-        embed.description = "A feature-rich music bot for Discord"
-        
-        # Playback commands
-        playback = (
-            "`/play [name]` › Play from queue or library\n"
-            "`/pause` › Pause playback\n"
-            "`/resume` › Resume playback\n"
-            "`/stop` › Stop (queue intact)\n"
-            "`/skip` › Skip to next track\n"
-            "`/previous` › Go back to previous track\n"
-            "`/volume` › Set volume (0-120)\n"
-            "`/speed` › Adjust speed (menu)\n"
-            "`/forward` `/backward` › Seek by seconds\n"
-            "`/seek` › Jump to specific time\n"
-            "`/loop [mode]` › Loop current track (menu)"
+        embed.title = f"{EMOJI['music']} SporkMP3"
+        embed.description = (
+            "Use `/play`, `/library`, or `/playlist` to open the hub panels.\n"
+            "Power users can also use the queue commands directly."
         )
-        embed.add_field(name=f"{EMOJI['play']} Playback", value=playback, inline=False)
-        
-        # Queue commands
-        queue = (
-            "`/queue` › View queue\n"
-            "`/seekqueue` › Jump to position\n"
-            "`/playing` › Current track info\n"
-            "`/clear` › Clear entire queue\n"
-            "`/remove` › Remove specific track"
-        )
-        embed.add_field(name=f"{EMOJI['queue']} Queue", value=queue, inline=False)
-        
-        # Library commands
-        library = (
-            "`/upload <name>` › Save file or URL to library\n"
-            "`/save <name> <url>` › Save CDN link to library\n"
-            "`/library` › Browse & queue library sounds\n"
-            "`/remove_sound` › Delete from library"
-        )
-        embed.add_field(name=f"{EMOJI['cd']} Library", value=library, inline=False)
 
-        # Playlist commands
-        playlists = (
-            "`/playlist create` › Create a playlist *(admin)*\n"
-            "`/playlist delete` › Delete a playlist *(admin)*\n"
-            "`/playlist add` › Add library tracks *(admin)*\n"
-            "`/playlist remove` › Remove a track *(admin)*\n"
-            "`/playlist list` › View all playlists\n"
-            "`/playlist view` › Browse & queue from playlist\n"
-            "`/playlist play` › Queue entire playlist"
-        )
-        embed.add_field(name=f"{EMOJI['queue']} Playlists", value=playlists, inline=False)
-        
-        # Admin commands
-        admin = (
-            "`/settings` › Interactive settings panel\n"
-            "`/autoplay` › Toggle autoplay\n"
-            "`/autodisconnect` › Toggle auto-disconnect\n"
-            "`/blacklist` › Manage user blacklist\n"
-            "`/role_config` › Configure role permissions\n"
-            "`/health` › Bot health stats"
-        )
-        embed.add_field(name=f"{EMOJI['settings']} Admin", value=admin, inline=False)
-        
-        # Upload tips
         embed.add_field(
-            name=f"{EMOJI['info']} Quick Features",
+            name="Player",
             value=(
-                "**Queue:** Mention the bot with files or CDN links to add to queue\n"
-                "**Library:** Use `/upload` with file or URL to save permanently"
+                "`/play [name]` › Open the Player Hub (or queue a named library track)\n"
+                "`/playing` › Re-open the Player Hub\n"
+                "`/library` › Open the Library browser\n"
+                "`/playlist` › Open the Playlist manager\n"
+                "**Hub buttons** › ◀◀ ▶/‖ ■ ▶▶ ↻ transport · Library · Playlists · Queue"
             ),
             inline=False
         )
-        
+
+        embed.add_field(
+            name="Playback",
+            value=(
+                "`/volume <0-120>` › Set volume\n"
+                "`/speed` › Adjust playback speed\n"
+                "`/loop` › Toggle infinite loop · `/loop 3` › Loop 3× · `/loop 0` › Off\n"
+                "`/forward <s>` `/backward <s>` › Seek by seconds\n"
+                "`/seek` › Jump to specific timestamp"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Queue",
+            value=(
+                "`/clear` › Clear queue and stop\n"
+                "`/remove <pos>` › Remove a track by position\n"
+                "`/disconnect` › Leave voice and clear queue"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Library",
+            value=(
+                "`/upload <name>` › Save a file or URL to the library\n"
+                "**In Library panel** › ↑ Upload URL · Remove Track *(admin)*"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Admin",
+            value=(
+                "`/settings` › Autoplay, auto-disconnect, speed, access control\n"
+                "`/health` › Bot health and diagnostic stats"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Tips",
+            value=(
+                "**Mention the bot** with audio files or CDN links to queue them instantly\n"
+                "**Playlists** group library tracks — manage them inside the Playlists panel"
+            ),
+            inline=False
+        )
+
         await interaction.response.send_message(embed=embed)
 
 

@@ -17,19 +17,40 @@ from typing import Set, Optional, List
 class Colors:
     """Color palette for embeds"""
     PRIMARY = 0x3e4566    # Dark blue-gray - Main/Playing/Info
-    ACCENT = 0xff914d     # Orange - Actions (skip, stop, pause, etc)
-    ERROR = 0xf50b17      # Red - Errors/Warnings ONLY
+    ACCENT = 0xff914d     # Orange - Success actions
+    WARNING = 0xffc300    # Amber - Warnings
+    ERROR = 0xf50b17      # Red - Errors only
 
 
 # ============================================================================
 # EMOJIS - Centralized emoji definitions
 # ============================================================================
 EMOJI = {
-    'play': '▶️', 'pause': '⏸️', 'resume': '⏯️', 'stop': '⏹️', 'skip': '⏭️',
-    'queue': '📜', 'music': '🎵', 'warning': '⚠️', 'error': '❌', 'success': '✅',
-    'time': '⏰', 'loop': '🔄', 'volume': '🔊', 'mute': '🔇', 'disconnect': '👋', 'loading': '⏳',
-    'microphone': '🎙️', 'cd': '💿', 'settings': '⚙️', 'user': '👤', 'role': '👥',
-    'info': 'ℹ️', 'fast': '⚡', 'slow': '🐌', 'bar': '━'
+    'play':       '▶',   # U+25B6  BLACK RIGHT-POINTING TRIANGLE
+    'pause':      '‖',   # U+2016  DOUBLE VERTICAL LINE
+    'resume':     '▶',
+    'stop':       '■',   # U+25A0  BLACK SQUARE
+    'skip':       '▶▶',
+    'queue':      '≡',   # U+2261  IDENTICAL TO (triple bar)
+    'music':      '♪',   # U+266A  EIGHTH NOTE
+    'warning':    '▲',   # U+25B2  BLACK UP-POINTING TRIANGLE
+    'error':      '✕',   # U+2715  MULTIPLICATION X
+    'success':    '✓',   # U+2713  CHECK MARK
+    'time':       '◷',   # U+25F7  WHITE CIRCLE WITH UPPER RIGHT QUADRANT
+    'loop':       '↻',   # U+21BB  CLOCKWISE OPEN CIRCLE ARROW
+    'volume':     '◆',   # U+25C6  BLACK DIAMOND
+    'mute':       '◇',   # U+25C7  WHITE DIAMOND
+    'disconnect': '←',   # U+2190  LEFTWARDS ARROW
+    'loading':    '…',   # U+2026  HORIZONTAL ELLIPSIS
+    'microphone': '◎',   # U+25CE  BULLSEYE
+    'cd':         '◆',
+    'settings':   '◈',   # U+25C8  WHITE DIAMOND CONTAINING BLACK SMALL DIAMOND
+    'user':       '●',   # U+25CF  BLACK CIRCLE
+    'role':       '○',   # U+25CB  WHITE CIRCLE
+    'info':       '·',   # U+00B7  MIDDLE DOT
+    'fast':       '»',   # U+00BB  RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK
+    'slow':       '«',   # U+00AB  LEFT-POINTING DOUBLE ANGLE QUOTATION MARK
+    'bar':        '━',   # U+2501  BOX DRAWINGS HEAVY HORIZONTAL
 }
 
 
@@ -48,7 +69,7 @@ def create_embed(title: str = None, description: str = None, color: int = None) 
     if description:
         embed.description = description
     
-    embed.set_footer(text="SporkMP3", icon_url="https://i.imgur.com/placeholder.png")
+    embed.set_footer(text="SporkMP3")
     embed.timestamp = discord.utils.utcnow()
     
     return embed
@@ -85,8 +106,8 @@ def error_embed(message: str, title: str = "Error") -> discord.Embed:
 
 
 def warning_embed(message: str, title: str = "Warning") -> discord.Embed:
-    """Quick warning embed with red color"""
-    embed = create_embed(color=Colors.ERROR)
+    """Quick warning embed with amber color"""
+    embed = create_embed(color=Colors.WARNING)
     embed.title = f"{EMOJI['warning']} {title}"
     embed.description = message
     return embed

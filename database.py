@@ -115,7 +115,20 @@ class Database:
         for statement in tables.strip().split(';'):
             if statement.strip():
                 self._execute(statement)
+        self._migrate()
         logging.info("Database initialized")
+
+    def _migrate(self):
+        """Add columns that were introduced after the initial schema."""
+        migrations = [
+            "ALTER TABLE guild_settings ADD COLUMN playback_speed INTEGER DEFAULT 100",
+            "ALTER TABLE guild_settings ADD COLUMN last_rating_request INTEGER DEFAULT 0",
+        ]
+        for sql in migrations:
+            try:
+                self._execute(sql)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
     
     # ========== Guild Settings ==========
     

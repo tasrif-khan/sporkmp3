@@ -33,9 +33,10 @@ class AudioTrack:
     volume: int = 100
     
     # Metadata
-    title: Optional[str] = None  # Song title from metadata
-    artist: Optional[str] = None  # Artist from metadata
-    
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    cover_url: Optional[str] = None  # Discord CDN URL once artwork has been uploaded
+
     # Playback tracking
     position: float = 0
     playback_start_time: Optional[float] = None
@@ -56,6 +57,29 @@ class AudioTrack:
         name = name.replace('_', ' ')  # Replace underscores with spaces
         return name
     
+    def get_artwork(self) -> Optional[bytes]:
+        """Return raw cover art bytes extracted from the audio file, or None."""
+        path = self.playback_path or self.downloaded_path
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            audio = MutagenFile(path)
+            if audio is None:
+                return None
+            if isinstance(audio, MP3) and audio.tags:
+                for key in audio.tags.keys():
+                    if key.startswith('APIC'):
+                        return audio.tags[key].data
+            elif isinstance(audio, MP4) and audio.tags:
+                covr = audio.tags.get('covr', [])
+                if covr:
+                    return bytes(covr[0])
+            elif hasattr(audio, 'pictures') and audio.pictures:
+                return audio.pictures[0].data
+        except Exception as e:
+            logging.debug(f"Artwork extraction failed for {path}: {e}")
+        return None
+
     @property
     def playback_path(self) -> Optional[str]:
         """Path to use for FFmpeg playback — converted file if available, else original"""
@@ -323,6 +347,7 @@ class GuildState:
     
     # UI state
     last_np_message: object = None  # discord.Message reference for edit-in-place
+    last_np_track: object = None    # AudioTrack the NP message was sent for
     
     @property
     def current_track(self) -> Optional[AudioTrack]:
@@ -342,6 +367,7 @@ class GuildState:
         self.manual_queue_seek = False
         self.is_stopped = False
         self.last_np_message = None
+        self.last_np_track = None
 
 
 class MusicState:
