@@ -5,6 +5,7 @@
     "max_queue_size_mb": 200,
     "max_guilds_per_shard": 40,
     "shard_count": 3,
+    "max_permanent_storage_mb": 500,
     "resource_limits": {
         "max_tracks_per_guild": 25,
         "max_track_duration_minutes": 180,

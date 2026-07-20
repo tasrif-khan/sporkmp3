@@ -2239,8 +2239,7 @@ class Music(commands.Cog):
 
         # ── Edit in place (same track) ────────────────────────────────────
         if state.last_np_message:
-            if track.cover_url:
-                embed.set_thumbnail(url=track.cover_url)
+            embed.set_thumbnail(url="attachment://cover.png")
             try:
                 await state.last_np_message.edit(embed=embed, view=view)
                 return
@@ -2326,8 +2325,7 @@ class Music(commands.Cog):
         try:
             embed = self._build_now_playing_embed(guild, state)
             view  = PlayerHubView(self, guild)
-            if track.cover_url:
-                embed.set_thumbnail(url=track.cover_url)
+            embed.set_thumbnail(url="attachment://cover.png")
             await state.last_np_message.edit(embed=embed, view=view)
         except Exception as e:
             logging.debug(f"Could not refresh NP embed: {e}")
@@ -2692,17 +2690,11 @@ class Music(commands.Cog):
         hub   = PlayerHubView(self, interaction.guild)
         embed = hub.build_embed()
         track = state.current_track
-        if track and track.cover_url:
-            embed.set_thumbnail(url=track.cover_url)
-            msg = await interaction.followup.send(embed=embed, view=hub)
-        else:
-            embed.set_thumbnail(url="attachment://cover.png")
-            msg = await interaction.followup.send(embed=embed, view=hub,
-                                                   file=self._cover_file(track))
-            if msg.attachments and track:
-                track.cover_url     = msg.attachments[0].url
-                state.last_np_track = track
-
+        embed.set_thumbnail(url="attachment://cover.png")
+        msg = await interaction.followup.send(embed=embed, view=hub, file=self._cover_file(track))
+        if msg.attachments and track:
+            track.cover_url     = msg.attachments[0].url
+            state.last_np_track = track
         state.last_np_message = msg
 
         if start_playback:
@@ -3065,36 +3057,29 @@ class Music(commands.Cog):
         hub   = PlayerHubView(self, interaction.guild)
         embed = hub.build_embed()
         track = state.current_track
-        if track and track.cover_url:
-            embed.set_thumbnail(url=track.cover_url)
-            msg = await interaction.followup.send(embed=embed, view=hub)
-        else:
-            embed.set_thumbnail(url="attachment://cover.png")
-            msg = await interaction.followup.send(embed=embed, view=hub,
-                                                   file=self._cover_file(track))
-            if msg.attachments and track:
-                track.cover_url     = msg.attachments[0].url
-                state.last_np_track = track
+        embed.set_thumbnail(url="attachment://cover.png")
+        msg = await interaction.followup.send(embed=embed, view=hub, file=self._cover_file(track))
+        if msg.attachments and track:
+            track.cover_url     = msg.attachments[0].url
+            state.last_np_track = track
         state.last_np_message = msg
 
     @app_commands.command(name="library", description="Open the library browser")
     @check_permissions()
     @safe_defer
     async def library(self, interaction: discord.Interaction):
-        state = await self._get_state(interaction)
+        await self._get_state(interaction)
         tracks = self.db.list_tracks(interaction.guild_id)
         view   = LibraryView(tracks, interaction.guild_id, self, from_hub=True)
-        msg    = await interaction.followup.send(embed=view.build_embed(), view=view)
-        state.last_np_message = msg
+        await interaction.followup.send(embed=view.build_embed(), view=view)
 
     @app_commands.command(name="playlist", description="Open the playlist manager")
     @check_permissions()
     @safe_defer
     async def playlist(self, interaction: discord.Interaction):
-        state = await self._get_state(interaction)
+        await self._get_state(interaction)
         view  = PlaylistManagerView(self, interaction.guild, interaction.user, from_hub=True)
-        msg   = await interaction.followup.send(embed=view.build_embed(), view=view)
-        state.last_np_message = msg
+        await interaction.followup.send(embed=view.build_embed(), view=view)
 
     @app_commands.command(name="clear", description="Clear queue and stop")
     @check_permissions()
